@@ -20,8 +20,9 @@
 #include "kl_aaudio.h"
 #include "kl_openxr.h"
 
-#define KL_MAX_IMAGES 64
-typedef struct { char soname[128]; kl_image *img; } entry;
+#define KL_MAX_IMAGES 1024   // VeRantyx: was 64; Alyx loads ~110 images
+typedef struct { char soname[128]; kl_image *img;     char real[1024];       // realpath of the file, so two names for one file are one image
+} entry;
 static entry  g_imgs[KL_MAX_IMAGES];
 static int    g_nimgs = 0;
 static char   g_libdir[512] = ".";
@@ -85,11 +86,16 @@ int kl_dl_iterate_phdr(int (*cb)(void *, size_t, void *), void *data) {
 }
 
 // Register an image so guest dlsym/dladdr can see it (also used for the root libs).
+void (*kl_image_loaded_hook)(const char *path, kl_image *img);
+
 void kl_register_image(const char *soname, kl_image *img) {
     const char *base = basename_of(soname);
     pthread_mutex_lock(&g_lock);
+    if (g_nimgs >= KL_MAX_IMAGES)
+        fprintf(stderr, "  [klepton] image table full (%d): %s is not visible to dlsym\n", KL_MAX_IMAGES, soname);
     if (g_nimgs < KL_MAX_IMAGES) {
         snprintf(g_imgs[g_nimgs].soname, sizeof g_imgs[0].soname, "%s", base);
+        if (!realpath(soname, g_imgs[g_nimgs].real)) snprintf(g_imgs[g_nimgs].real, sizeof g_imgs[0].real, "%s", soname);
         g_imgs[g_nimgs].img = img;
         g_nimgs++;
     }
@@ -103,12 +109,15 @@ void kl_register_image(const char *soname, kl_image *img) {
     // here — not searching for any GL library, which klepton.h warns breaks Steam
     // Link/VRChat/RE4 — routes them to gl4es for every driver.
     if (!strcmp(base, "libgl4es.so")) kl_shim_set_guest_gl(img);
+    if (kl_image_loaded_hook) kl_image_loaded_hook(soname, img);
 }
 
 kl_image *kl_find_image(const char *soname) {
     const char *b = basename_of(soname);
+    char rp[1024];
+    const char *real = strchr(soname, '/') && realpath(soname, rp) ? rp : NULL;
     for (int i = 0; i < g_nimgs; i++)
-        if (strcmp(g_imgs[i].soname, b) == 0) return g_imgs[i].img;
+        if (strcmp(g_imgs[i].soname, b) == 0 || (real && strcmp(g_imgs[i].real, real) == 0)) return g_imgs[i].img;
     return NULL;
 }
 
@@ -302,6 +311,15 @@ void *kl_guest_sym_global(const char *name) {
     return v;
 }
 
+int kl_guest_tls_sym_global(const char *name, kl_tls_module **m, uint64_t *off) {
+    int rc = -1;
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < g_nimgs && rc != 0; i++)
+        if (kl_sym_tls(g_imgs[i].img, name, off) == 0) { *m = kl_image_tls_module(g_imgs[i].img); rc = 0; }
+    pthread_mutex_unlock(&g_lock);
+    return rc;
+}
+
 // Load an .so together with its DT_NEEDED chain, dependencies first, so each
 // image's relocation-time imports can bind against the images it needs
 // (kl_guest_sym_global). Names with no file in the library path are assumed
@@ -320,6 +338,12 @@ static int kl_dep_is_shim_served(const char *name) {
         // kl_guest_sym_global — not a packaging gap.
         "libOVRPlugin.so", "libovrplatformloader.so", "libvrapi.so",
         "libopenxr_loader.so", "libOpenMAXAL.so",
+        // glibc guests: the C runtime is served by the host shim, never loaded
+        // as a guest image; windowing and device libraries are stubbed by name.
+        "libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0", "librt.so.1",
+        "libutil.so.1", "libresolv.so.2", "ld-linux-aarch64.so.1",
+        "libX11.so.6", "libXext.so.6", "libxcb.so.1", "libwayland-client.so.0",
+        "libudev.so.1", "libdrm.so.2", "libmimalloc.so",
     };
     for (unsigned i = 0; i < sizeof shim / sizeof shim[0]; i++)
         if (!strcmp(name, shim[i])) return 1;
@@ -348,9 +372,37 @@ static void kl_maybe_jni_onload(const char *path, kl_image *img) {
             b, r);
 }
 
+// Libraries whose DT_NEEDED chain is being walked right now. A dependency that
+// is already on this list is skipped (its symbols bind late, see
+// kl_rebind_missing), and when the outermost load finishes every image's
+// missing imports are tried again.
+static kl_image *kl_load_recursive_inner(const char *path);
+static char g_loading_names[64][128];
+static int g_loading_n;
+static int g_loading_sentinel_storage;
+static int loading_has(const char *b) { for (int i = 0; i < g_loading_n; i++) if (!strcmp(g_loading_names[i], b)) return 1; return 0; }
+
 kl_image *kl_load_recursive(const char *path) {
     kl_image *have = kl_find_image(path);
-    if (have) return have;                       // cycle guard / already loaded
+    if (have) return have;                       // already loaded
+    const char *bname = strrchr(path, '/'); bname = bname ? bname + 1 : path;
+    if (loading_has(bname)) {
+        if (kl_env_on("KL_TRACE_NEEDED", 1)) fprintf(stderr, "  [dl] %s is already being loaded (dependency cycle) — bound late\n", bname);
+        return (kl_image *)&g_loading_sentinel_storage;      // non-NULL: the dependent carries on
+    }
+    if (g_loading_n < 64) snprintf(g_loading_names[g_loading_n++], 128, "%s", bname);
+    kl_image *result = kl_load_recursive_inner(path);
+    if (g_loading_n > 0) g_loading_n--;
+    if (g_loading_n == 0) {
+        pthread_mutex_lock(&g_lock);
+        int n = g_nimgs;
+        pthread_mutex_unlock(&g_lock);
+        for (int i = 0; i < n; i++) kl_rebind_missing(g_imgs[i].img);
+    }
+    return result;
+}
+
+static kl_image *kl_load_recursive_inner(const char *path) {
 
     char names[32][128];
     int nn = kl_list_needed(path, names, 32);
@@ -696,6 +748,32 @@ static int kl_core_shim_claims(const char *path) {
 
 static int kl_core_shim_is_handle(void *h) { return h == (void *)&g_core_shim_handle; }
 
+// ---- host modules ----
+// A library the HOST implements for the guest, keyed by a path suffix
+// ("/vrclient.so"): dlopen of such a path returns a handle whose dlsym asks the
+// registered lookup. Up to 8; the handle is the registry entry's address.
+struct kl_host_module { const char *suffix; void *(*lookup)(const char *); };
+static struct kl_host_module g_host_mods[8];
+static unsigned g_host_mods_n;
+void kl_dl_add_host_module(const char *suffix, void *(*lookup)(const char *)) {
+    if (g_host_mods_n < 8) { g_host_mods[g_host_mods_n].suffix = suffix; g_host_mods[g_host_mods_n].lookup = lookup; g_host_mods_n++; }
+}
+static void *kl_host_module_dlopen(const char *path) {
+    size_t n = strlen(path);
+    for (unsigned i = 0; i < g_host_mods_n; i++) {
+        size_t m = strlen(g_host_mods[i].suffix);
+        if (n >= m && !strcmp(path + n - m, g_host_mods[i].suffix)) {
+            fprintf(stderr, "  [klepton] guest dlopen(%s) -> host module\n", path);
+            return &g_host_mods[i];
+        }
+    }
+    return NULL;
+}
+static struct kl_host_module *kl_host_module_handle(void *h) {
+    for (unsigned i = 0; i < g_host_mods_n; i++) if (h == (void *)&g_host_mods[i]) return &g_host_mods[i];
+    return NULL;
+}
+
 void *klb_dlopen(const char *path, int flags) {
     (void)flags;
     { static int once; if (!once) { once = 1; kl_dl_trace_shims(); } }
@@ -747,6 +825,7 @@ void *klb_dlopen(const char *path, int flags) {
     // The always-resident Android system libraries (libc/libdl/libm/...). No file
     // to open; served with a handle whose dlsym routes to the shim table. Must
     // come before the file-load fallthrough, which would fail and hand back NULL.
+    { void *hm = kl_host_module_dlopen(path); if (hm) return hm; }
     if (kl_core_shim_claims(path)) {
         fprintf(stderr, "  [klepton] guest dlopen(\"%s\") -> shim-served handle\n", path);
         return (void *)&g_core_shim_handle;
@@ -835,6 +914,7 @@ static void *klb_dlsym_null(const char *name) {
 }
 
 void *klb_dlsym(void *handle, const char *name) {
+    { struct kl_host_module *hm = kl_host_module_handle(handle); if (hm) return hm->lookup(name); }
     if (kl_egl_is_handle(handle)) return kl_egl_sym(name);
     if (kl_opensl_is_handle(handle)) return kl_opensl_sym(name);
     if (kl_ovrp_is_handle(handle)) return kl_ovrp_sym(name);
@@ -880,6 +960,7 @@ void *klb_dlsym(void *handle, const char *name) {
     void *v = kl_sym((kl_image *)handle, name);
     if (!v) { snprintf(g_dlerr, sizeof g_dlerr, "klepton: undefined symbol: %s", name);
               return klb_dlsym_null(name); }
+    { void *w = kl_interpose_lookup(name); if (w) return w; }
     { void *w = kl_dl_interpose(name, v); if (w) return w; }
     return v;
 }

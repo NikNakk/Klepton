@@ -828,6 +828,85 @@ int kl_x18_emit(void *code, size_t size, uint64_t code_va,
             continue;
         }
 
+        // ---- glibc guest shapes (x18 is a general register on Linux) ----
+        if (out + VEN_MAX_INSN <= pool_end) {
+            uint32_t body[VEN_MAX_INSN], patch;
+            unsigned k = 0;
+            int ok = 1, served = 0;
+            if (word == 0xD63F0240u) {
+                // blr x18: call through the shadow via x16 (IP0, which every
+                // call may clobber), never through the real x18: the kernel can
+                // zero x18 between loading it and the blr, and the race
+                // recovery then resumed the callee with the wrong return
+                // address (libmpg123's dct36 calls: corrupted state, crash).
+                // Return lands in the veneer, which branches back behind the site.
+                body[k++] = enc_mrs_tpidrro(16);
+                body[k++] = enc_ldr(16, 16, (unsigned)KLX_TSD_SLOT * 8);
+                body[k++] = 0xD63F0200u;                 // blr x16
+                ok &= enc_b(vpc + k * 4, spc + 4, &body[k]); k++;
+                served = 1;
+            } else if (in.pcrel == KLX_PC_ADR && (word & 0x9F000000u) == 0x10000000u && (word & 31u) == 18) {
+                // adr x18, label: the address is a constant, materialised into the shadow.
+                int64_t imm = (int64_t)(((word >> 5) & 0x7FFFFu) << 2 | ((word >> 29) & 3u));
+                if (imm & (1LL << 20)) imm -= (1LL << 21);
+                uint64_t target = spc + (uint64_t)imm;
+                unsigned a, b;
+                pick_scratch(in.gp_used, &a, &b);
+                body[k++] = enc_stp(a, b, -16);
+                body[k++] = enc_mrs_tpidrro(a);
+                k += enc_mov_imm64(b, target, body + k);
+                body[k++] = enc_str(b, a, (unsigned)KLX_TSD_SLOT * 8);
+                body[k++] = enc_ldp(a, b, -16);
+                ok &= enc_b(vpc + k * 4, spc + 4, &body[k]); k++;
+                served = 1;
+            } else if (in.hazard == KLX_HZ_SPWRITE && (word & 0xFFC00000u) == 0xA9800000u && ((word >> 5) & 31u) == 31u) {
+                // stp Xt, Xt2, [sp, #imm]!  — scratch spilled below the pair's
+                // destination, the pair written (x18 read from the shadow) with
+                // the original writeback, scratch restored from the new sp.
+                int imm = (int)((word >> 15) & 0x7Fu); if (imm & 0x40) imm -= 0x80; imm *= 8;
+                if (imm - 16 >= -512 && imm <= 0) {
+                    unsigned a, b;
+                    pick_scratch(in.gp_used, &a, &b);
+                    body[k++] = enc_stp(a, b, imm - 16);
+                    body[k++] = enc_mrs_tpidrro(a);
+                    body[k++] = enc_ldr(b, a, (unsigned)KLX_TSD_SLOT * 8);
+                    body[k++] = klx_substitute(word, &in, b);
+                    body[k++] = enc_ldp(a, b, -16);
+                    ok &= enc_b(vpc + k * 4, spc + 4, &body[k]); k++;
+                    served = 1;
+                }
+            } else if (in.hazard == KLX_HZ_SPWRITE && (word & 0xFFC00000u) == 0xA8C00000u && ((word >> 5) & 31u) == 31u) {
+                // ldp Xt, Xt2, [sp], #imm — the pair is loaded (x18's value into
+                // scratch b) with the original writeback, b goes to the shadow,
+                // scratch is restored from where it was spilled (old sp - 16).
+                int imm = (int)((word >> 15) & 0x7Fu); if (imm & 0x40) imm -= 0x80; imm *= 8;
+                if (imm >= 0 && -16 - imm >= -512) {
+                    unsigned a, b;
+                    pick_scratch(in.gp_used, &a, &b);
+                    body[k++] = enc_stp(a, b, -16);
+                    body[k++] = klx_substitute(word, &in, b);
+                    body[k++] = enc_mrs_tpidrro(a);
+                    body[k++] = enc_str(b, a, (unsigned)KLX_TSD_SLOT * 8);
+                    body[k++] = enc_ldp(a, b, -16 - imm);
+                    ok &= enc_b(vpc + k * 4, spc + 4, &body[k]); k++;
+                    served = 1;
+                }
+            }
+            if (served) {
+                ok &= (k <= VEN_MAX_INSN) && enc_b(spc, vpc, &patch);
+                if (!ok) {
+                    note_refusal(word); st->refused++;
+                    if (out_of_reach(spc, vpc)) st->far_refused++;
+                    continue;
+                }
+                memcpy(out, body, k * 4);
+                out += k;
+                w[i] = patch;
+                st->patched++;
+                continue;
+            }
+        }
+
         if (in.hazard || in.pcrel == KLX_PC_ADR || in.pcrel == KLX_PC_LITERAL ||
             out + VEN_MAX_INSN > pool_end) { note_refusal(word); st->refused++; continue; }
 

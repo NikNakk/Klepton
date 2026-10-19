@@ -1315,6 +1315,27 @@ static void proc_build(void) {
         snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/cpu_capacity", i);
         proc_put(rel, "1024\n");
     }
+    {
+        int perf = 0; size_t sz = sizeof perf;
+        if (sysctlbyname("hw.perflevel0.logicalcpu", &perf, &sz, NULL, 0) != 0 || perf <= 0 || perf > ncpu) perf = (int)ncpu;
+        char sib[64];
+        if (ncpu > 1) snprintf(sib, sizeof sib, "0-%ld\n", ncpu - 1); else snprintf(sib, sizeof sib, "0\n");
+        for (long i = 0; i < ncpu; i++) {
+            char rel[256], val[32];
+            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/core_id", i);
+            snprintf(val, sizeof val, "%ld\n", i); proc_put(rel, val);
+            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/physical_package_id", i);
+            proc_put(rel, "0\n");
+            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/thread_siblings_list", i);
+            proc_put(rel, val);
+            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/core_siblings_list", i);
+            proc_put(rel, sib);
+            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/package_cpus_list", i);
+            proc_put(rel, sib);
+            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/cpu_capacity", i);
+            proc_put(rel, i < perf ? "1024\n" : "400\n");          // performance cores first
+        }
+    }
     // Some guests size their core loop from kernel_max (highest possible CPU
     // index) rather than from /possible. Pin it to the last slot we serve so the
     // loop's upper bound and the nodes that exist agree.
@@ -2868,10 +2889,23 @@ int kl_fcntl(int fd, int cmd, uintptr_t arg) {
     // with l_type/l_whence, Darwin with l_start/l_len), so forwarding the
     // pointer would silently lock a different range. Refused by name until
     // something needs it — no guest has yet.
-    case LX_F_GETLK: case LX_F_SETLK: case LX_F_SETLKW:
-        warn_once("fcntl file locking (struct flock layout differs) — refused");
-        errno = EINVAL;
-        return -1;
+    case LX_F_GETLK: case LX_F_SETLK: case LX_F_SETLKW: {
+        // Linux/aarch64 struct flock leads with l_type/l_whence, Darwin's with
+        // l_start/l_len, and the F_RDLCK/F_WRLCK/F_UNLCK values differ (0/1/2 vs
+        // 1/3/2), so the record is translated both ways.
+        struct lx_flock { int16_t l_type, l_whence; int32_t pad; int64_t l_start, l_len; int32_t l_pid, pad2; };
+        struct lx_flock *lx = (struct lx_flock *)arg;
+        struct flock d; memset(&d, 0, sizeof d);
+        d.l_type = lx->l_type == 0 ? F_RDLCK : lx->l_type == 1 ? F_WRLCK : F_UNLCK;
+        d.l_whence = lx->l_whence; d.l_start = lx->l_start; d.l_len = lx->l_len; d.l_pid = lx->l_pid;
+        int dcmd = cmd == LX_F_GETLK ? F_GETLK : cmd == LX_F_SETLK ? F_SETLK : F_SETLKW;
+        int r = fcntl(fd, dcmd, &d);
+        if (r == 0 && cmd == LX_F_GETLK) {
+            lx->l_type = d.l_type == F_RDLCK ? 0 : d.l_type == F_WRLCK ? 1 : 2;
+            lx->l_whence = d.l_whence; lx->l_start = d.l_start; lx->l_len = d.l_len; lx->l_pid = d.l_pid;
+        }
+        return r;
+    }
     default:
         fcntl_warn_once("fcntl", cmd);
         errno = EINVAL;
