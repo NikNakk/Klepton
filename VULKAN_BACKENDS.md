@@ -39,3 +39,51 @@ strict mode before a game trace can establish driver requirements reliably;
 the trace does not endorse them. In particular, compare pre-clamp requests
 with driver answers and forwarded requests. Disable async compilation when
 measuring synchronous compilation cost. No guest game code was run here.
+
+## Strict graphics boundary
+
+`KL_VK_STRICT=1` is opt-in and latched on first use. The legacy path remains
+the default. In strict mode:
+
+- Graphics/shader/render-pass/property commands go directly to the selected
+  Vulkan dispatch implementation. Klepton's repair, emulation and async-pipeline
+  wrappers are bypassed. Missing functions return NULL; no success stub is used.
+- Instance/device requests preserve API version, layers, feature structures,
+  pNext and requested extensions. Unsupported requests reach the driver and its
+  error is returned. No feature clamp/retry, GPU/null-handle substitution or
+  automatic Metal-object extension addition occurs.
+- The implemented synthetic desktop WSI remains adapted. Its instance extension
+  names are removed from the request passed to the native driver; advertised
+  Vulkan portability enumeration/subset requirements are appended when needed.
+  This intentionally remains a synthetic desktop swapchain, not native desktop
+  presentation or a claim of complete Vulkan loader/WSI conformance.
+- Extension lists are allocated to request size rather than capped at 64 names.
+  Instance enumeration errors and layer errors propagate. Device bookkeeping is
+  released on destroy; strict bookkeeping overflow destroys/refuses the device.
+
+Owned fake-driver request-preservation checks (no GPU):
+
+```sh
+sh tools/check_vulkan_strict.sh
+```
+
+Real driver initialization, feature query, device creation, missing function,
+unsupported-feature refusal and complete extension/driver census (no game or XR):
+
+```sh
+KL_VULKAN_LIBRARY=/opt/homebrew/lib/libvulkan.1.dylib \
+VK_DRIVER_FILES=/opt/homebrew/Cellar/molten-vk/1.4.2/etc/vulkan/icd.d/MoltenVK_icd.json \
+sh tools/check_vulkan_strict_real.sh
+
+KL_VULKAN_LIBRARY=/opt/homebrew/lib/libvulkan.1.dylib \
+VK_DRIVER_FILES=/private/tmp/alyx-mesa-build/src/kosmickrisp/vulkan/kosmickrisp_mesa_devenv_icd.aarch64.json \
+sh tools/check_vulkan_strict_real.sh
+```
+
+20 October: both pass on Apple M5 outside the filesystem sandbox (sandboxed
+Metal access was unavailable). MoltenVK driverID14/info1.4.2, KosmicKrisp
+driverID28/Mesa27.0.0-devel git0913fce718. Each creates a device, returns
+VK_ERROR_FEATURE_NOT_PRESENT for geometryShader and preserves the requested
+true flag. Both query base fragmentDensityMap=false. This does not resolve
+KosmicKrisp's missing Metal-object interoperability with Monado and is not an
+Alyx run or a benchmark.
