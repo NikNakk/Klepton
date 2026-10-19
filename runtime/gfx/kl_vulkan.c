@@ -127,6 +127,51 @@ static int vk_trace(void) {
 #define VKT(...) do { if (vk_trace()) fprintf(stderr, "  [vk] " __VA_ARGS__); } while (0)
 #define VKI(...) fprintf(stderr, "  [vk] " __VA_ARGS__)
 
+// Observational tracing at the guest boundary, before compatibility filtering.
+// No feature/extension is added and no caller memory is modified by this trace.
+static int fdm_trace(void) { return kl_env_on("KL_VK_FOVEATION_TRACE", 0); }
+static void trace_chain(const char *where, const void *chain) {
+    if (!fdm_trace()) return;
+    for (const VkBaseInStructure *p = chain; p; p = p->pNext) {
+        VKI("fdm %s pNext sType=%u\n", where, (unsigned)p->sType);
+        switch (p->sType) {
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT: {
+            const VkPhysicalDeviceFragmentDensityMapFeaturesEXT *f = (const void *)p;
+            VKI("fdm %s features map=%u dynamic=%u nonSubsampled=%u\n", where,
+                f->fragmentDensityMap, f->fragmentDensityMapDynamic, f->fragmentDensityMapNonSubsampledImages);
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR: {
+            const VkPhysicalDeviceFragmentShadingRateFeaturesKHR *f = (const void *)p;
+            VKI("fdm %s shadingRate pipeline=%u primitive=%u attachment=%u\n", where,
+                f->pipelineFragmentShadingRate, f->primitiveFragmentShadingRate, f->attachmentFragmentShadingRate);
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_2_FEATURES_EXT:
+            VKI("fdm %s deferred=%u\n", where,
+                ((const VkPhysicalDeviceFragmentDensityMap2FeaturesEXT *)p)->fragmentDensityMapDeferred);
+            break;
+        case VK_STRUCTURE_TYPE_RENDER_PASS_FRAGMENT_DENSITY_MAP_CREATE_INFO_EXT: {
+            const VkRenderPassFragmentDensityMapCreateInfoEXT *f = (const void *)p;
+            VKI("fdm %s attachment=%u layout=%u\n", where,
+                f->fragmentDensityMapAttachment.attachment, f->fragmentDensityMapAttachment.layout);
+            break;
+        }
+        case VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_INFO_EXT: {
+            const VkRenderingFragmentDensityMapAttachmentInfoEXT *f = (const void *)p;
+            VKI("fdm %s view=%#llx layout=%u\n", where,
+                (unsigned long long)f->imageView, f->imageLayout);
+            break;
+        }
+        default: break;
+        }
+    }
+}
+static void trace_extensions(const char *where, uint32_t count, const char *const *names) {
+    if (!fdm_trace()) return;
+    for (uint32_t i = 0; i < count; i++) VKI("fdm %s extension=%s\n", where, names[i]);
+}
+
 // ---------------------------------------------------------------------------
 // Loading MoltenVK
 // ---------------------------------------------------------------------------
@@ -144,6 +189,12 @@ static void *mvk_try(const char *path) {
 }
 
 static void *mvk_open(void) {
+    // Standard loader route for selectable ICDs. Explicit failure is final.
+    const char *library = kl_env_str("KL_VULKAN_LIBRARY", NULL);
+    if (library) {
+        VKI("explicit Vulkan dispatch library: %s\n", library);
+        return mvk_try(library);
+    }
     const char *explicit = kl_env_str("KL_MVK_DYLIB", NULL);
     if (explicit) return mvk_try(explicit);
 
@@ -234,7 +285,7 @@ static void vk_init(void) {
 
     g_mvk = mvk_open();
     if (!g_mvk) {
-        VKI("MoltenVK could not be loaded — run 'make mvk' (BUILDING.md).\n");
+        VKI("Vulkan dispatch library could not be loaded — run 'make mvk' (BUILDING.md).\n");
         return;
     }
     real_gipa = (PFN_vkGetInstanceProcAddr)mvk_sym("vkGetInstanceProcAddr");
@@ -246,7 +297,7 @@ static void vk_init(void) {
         (PFN_vkEnumerateInstanceVersion)real_gipa(NULL, "vkEnumerateInstanceVersion");
     uint32_t ver = VK_API_VERSION_1_0;
     if (eiv) eiv(&ver);
-    VKI("MoltenVK loaded — instance API %u.%u.%u\n", VK_VERSION_MAJOR(ver),
+    VKI("Vulkan dispatch loaded — instance API %u.%u.%u\n", VK_VERSION_MAJOR(ver),
         VK_VERSION_MINOR(ver), VK_VERSION_PATCH(ver));
 }
 
@@ -485,6 +536,7 @@ static VkResult klvk_CreateInstance(const VkInstanceCreateInfo *ci,
                                     const VkAllocationCallbacks *alloc,
                                     VkInstance *out) {
     vk_init();
+    if (ci) trace_extensions("CreateInstance-request", ci->enabledExtensionCount, ci->ppEnabledExtensionNames);
     if (!g_avail) return VK_ERROR_INITIALIZATION_FAILED;
     PFN_vkCreateInstance real = (PFN_vkCreateInstance)real_gipa(NULL, "vkCreateInstance");
     PFN_vkEnumerateInstanceExtensionProperties enum_ext =
@@ -745,12 +797,16 @@ static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInf
     mine.enabledLayerCount = 0;
     mine.ppEnabledLayerNames = NULL;
 
+    trace_extensions("CreateDevice-request", ci->enabledExtensionCount, ci->ppEnabledExtensionNames);
+    trace_chain("CreateDevice-request", ci->pNext);
+    trace_extensions("CreateDevice-forwarded", mine.enabledExtensionCount, mine.ppEnabledExtensionNames);
     VkResult r = real(phys, &mine, alloc, out);
     if (r == VK_ERROR_FEATURE_NOT_PRESENT) {
         // Source 2 asks for a superset of features and copes with what it
         // gets; a feature MoltenVK lacks is turned off and the create retried.
         unsigned off = klvk_clamp_features(phys, &mine);
         VKI("vkCreateDevice: VK_ERROR_FEATURE_NOT_PRESENT — %u feature(s) turned off, retrying\n", off);
+        trace_chain("CreateDevice-clamped-retry", mine.pNext);
         r = real(phys, &mine, alloc, out);
     }
     free(have);
@@ -2987,6 +3043,9 @@ static int klvk_astc_sub_has(VkImage img) {
 }
 static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInfo *ci,
         const VkAllocationCallbacks *alloc, VkImage *out) {
+    if (fdm_trace()) VKI("fdm CreateImage format=%u usage=%#x flags=%#x extent=%ux%u layers=%u samples=%u\n", ci->format, ci->usage, ci->flags, ci->extent.width, ci->extent.height, ci->arrayLayers, ci->samples);
+    trace_chain("CreateImage", ci->pNext);
+
     static PFN_vkCreateImage real;
     if (!real && real_gdpa) real = (PFN_vkCreateImage)real_gdpa(dev, "vkCreateImage");
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
@@ -3525,6 +3584,8 @@ static void VKAPI_CALL klvk_CmdBeginRenderPass2(VkCommandBuffer cb,
 static VkResult VKAPI_CALL klvk_CreateRenderPass(VkDevice dev,
         const VkRenderPassCreateInfo *ci, const VkAllocationCallbacks *a,
         VkRenderPass *out) {
+    trace_chain("CreateRenderPass", ci->pNext);
+
     static PFN_vkCreateRenderPass real;
     if (!real && real_gdpa) real = (PFN_vkCreateRenderPass)real_gdpa(dev, "vkCreateRenderPass");
     VkResult r = real ? real(dev, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;
@@ -3554,6 +3615,8 @@ static VkResult VKAPI_CALL klvk_CreateRenderPass(VkDevice dev,
 static VkResult VKAPI_CALL klvk_CreateRenderPass2(VkDevice dev,
         const VkRenderPassCreateInfo2 *ci, const VkAllocationCallbacks *a,
         VkRenderPass *out) {
+    trace_chain("CreateRenderPass2", ci->pNext);
+
     static PFN_vkCreateRenderPass2 real;
     if (!real && real_gdpa) {
         real = (PFN_vkCreateRenderPass2)real_gdpa(dev, "vkCreateRenderPass2");
@@ -3652,6 +3715,8 @@ static VkResult VKAPI_CALL klvk_CreateRenderPass2(VkDevice dev,
 // render pass object, so this is the only place those renders are visible.
 static void VKAPI_CALL klvk_CmdBeginRendering(VkCommandBuffer cb,
         const VkRenderingInfo *ri) {
+    trace_chain("CmdBeginRendering", ri->pNext);
+    if (fdm_trace()) VKI("fdm rendering viewMask=%#x layers=%u\n", ri->viewMask, ri->layerCount);
     static PFN_vkCmdBeginRendering real;
     if (!real) {
         real = (PFN_vkCmdBeginRendering)mvk_sym("vkCmdBeginRendering");
@@ -4029,7 +4094,9 @@ static void VKAPI_CALL klvk_GetPhysicalDeviceFeatures2(
         if (!real) real = (PFN_vkGetPhysicalDeviceFeatures2)
             real_gipa(g_instance, "vkGetPhysicalDeviceFeatures2KHR"); } }
     pd = KLVK_PHYS_OR_SUB(pd, "GetPhysicalDeviceFeatures2");
+    trace_chain("Features2-request", f->pNext);
     if (real) real(pd, f);
+    trace_chain("Features2-result", f->pNext);
 }
 static void VKAPI_CALL klvk_GetPhysicalDeviceFeatures(
         VkPhysicalDevice pd, VkPhysicalDeviceFeatures *f) {
@@ -4115,7 +4182,13 @@ static VkResult VKAPI_CALL klvk_EnumerateDeviceExtensionProperties(
     if (!t) { t = 1; if (real_gipa) real = (PFN_vkEnumerateDeviceExtensionProperties)
         real_gipa(g_instance, "vkEnumerateDeviceExtensionProperties"); }
     pd = KLVK_PHYS_OR_SUB(pd, "EnumerateDeviceExtensionProperties");
-    if (real) return real(pd, layer, count, props);
+    if (real) {
+        VkResult result = real(pd, layer, count, props);
+        if (fdm_trace() && props && count && (result == VK_SUCCESS || result == VK_INCOMPLETE))
+            for (uint32_t i = 0; i < *count; i++)
+                VKI("fdm EnumerateDeviceExtensionProperties result=%s version=%u\n", props[i].extensionName, props[i].specVersion);
+        return result;
+    }
     if (count) *count = 0;
     return VK_SUCCESS;
 }
@@ -5394,6 +5467,19 @@ static uint32_t *klvk_spirv_mirror_rewrite(const uint32_t *in, size_t nwords,
 static VkResult VKAPI_CALL klvk_CreateShaderModule(VkDevice dev,
         const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *alloc,
         VkShaderModule *out) {
+    if (fdm_trace() && ci && ci->pCode && ci->codeSize >= 20 && !(ci->codeSize & 3)) {
+        const uint32_t *words = ci->pCode;
+        for (size_t at = 5; at < ci->codeSize / 4;) {
+            uint32_t length = words[at] >> 16, opcode = words[at] & 0xffff;
+            if (!length || at + length > ci->codeSize / 4) break;
+            // OpCapability and OpDecorate(BuiltIn), including FragSize/FragInvocationCount.
+            if (opcode == 17 && length >= 2)
+                VKI("fdm shader capability=%u\n", words[at + 1]);
+            if (opcode == 71 && length >= 4 && words[at + 2] == 11)
+                VKI("fdm shader builtin=%u target=%u\n", words[at + 3], words[at + 1]);
+            at += length;
+        }
+    }
     static PFN_vkCreateShaderModule real;
     if (!real && real_gdpa) real = (PFN_vkCreateShaderModule)real_gdpa(dev, "vkCreateShaderModule");
     if (!emu_on() || !ci || !ci->pCode || (ci->codeSize & 3u) || !real)
@@ -6160,6 +6246,8 @@ static void klvk_note_missing(const char *name) {
 
 static PFN_vkVoidFunction VKAPI_CALL klvk_GetInstanceProcAddr(VkInstance inst,
                                                               const char *name) {
+    if (fdm_trace() && name) VKI("fdm resolve=%s\n", name);
+
     vk_init();
     if (!name) return NULL;
     if (!strcmp(name, "vkGetInstanceProcAddr"))
@@ -6176,6 +6264,8 @@ static PFN_vkVoidFunction VKAPI_CALL klvk_GetInstanceProcAddr(VkInstance inst,
 
 static PFN_vkVoidFunction VKAPI_CALL klvk_GetDeviceProcAddr(VkDevice dev,
                                                             const char *name) {
+    if (fdm_trace() && name) VKI("fdm resolve=%s\n", name);
+
     vk_init();
     if (!name) return NULL;
     if (!strcmp(name, "vkGetDeviceProcAddr"))
