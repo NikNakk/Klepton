@@ -1269,6 +1269,63 @@ int kl_x18_emit_img(void *code, size_t size, uint64_t code_va,
             continue;
         }
 
+        // ---- stack-pointer writeback pairs that name x18 (glibc guests) ----
+        // From VeRantyx's Klepton patch set: stp Xt, Xt2, [sp, #imm]! and
+        // ldp Xt, Xt2, [sp], #imm with x18 as a data register are rebuilt with
+        // scratch registers spilled below sp, rather than refused. blr x18 and
+        // adr x18 are handled by the general cases above and below.
+        if (out + VEN_MAX_INSN <= pool_end) {
+            uint32_t body[VEN_MAX_INSN], patch;
+            unsigned k = 0;
+            int ok = 1, served = 0;
+            if (in.hazard == KLX_HZ_SPWRITE && (word & 0xFFC00000u) == 0xA9800000u && ((word >> 5) & 31u) == 31u) {
+                // stp Xt, Xt2, [sp, #imm]!  — scratch spilled below the pair's
+                // destination, the pair written (x18 read from the shadow) with
+                // the original writeback, scratch restored from the new sp.
+                int imm = (int)((word >> 15) & 0x7Fu); if (imm & 0x40) imm -= 0x80; imm *= 8;
+                if (imm - 16 >= -512 && imm <= 0) {
+                    unsigned a, b;
+                    pick_scratch(in.gp_used, &a, &b);
+                    body[k++] = enc_stp(a, b, imm - 16);
+                    body[k++] = enc_mrs_tpidrro(a);
+                    body[k++] = enc_ldr(b, a, (unsigned)KLX_TSD_SLOT * 8);
+                    body[k++] = klx_substitute(word, &in, b);
+                    body[k++] = enc_ldp(a, b, -16);
+                    ok &= enc_b(vpc + k * 4, spc + 4, &body[k]); k++;
+                    served = 1;
+                }
+            } else if (in.hazard == KLX_HZ_SPWRITE && (word & 0xFFC00000u) == 0xA8C00000u && ((word >> 5) & 31u) == 31u) {
+                // ldp Xt, Xt2, [sp], #imm — the pair is loaded (x18's value into
+                // scratch b) with the original writeback, b goes to the shadow,
+                // scratch is restored from where it was spilled (old sp - 16).
+                int imm = (int)((word >> 15) & 0x7Fu); if (imm & 0x40) imm -= 0x80; imm *= 8;
+                if (imm >= 0 && -16 - imm >= -512) {
+                    unsigned a, b;
+                    pick_scratch(in.gp_used, &a, &b);
+                    body[k++] = enc_stp(a, b, -16);
+                    body[k++] = klx_substitute(word, &in, b);
+                    body[k++] = enc_mrs_tpidrro(a);
+                    body[k++] = enc_str(b, a, (unsigned)KLX_TSD_SLOT * 8);
+                    body[k++] = enc_ldp(a, b, -16 - imm);
+                    ok &= enc_b(vpc + k * 4, spc + 4, &body[k]); k++;
+                    served = 1;
+                }
+            }
+            if (served) {
+                ok &= (k <= VEN_MAX_INSN) && enc_b(spc, vpc, &patch);
+                if (!ok) {
+                    note_refusal(word); st->refused++;
+                    if (out_of_reach(spc, vpc)) st->far_refused++;
+                    continue;
+                }
+                memcpy(out, body, k * 4);
+                out += k;
+                w[i] = patch;
+                st->patched++;
+                continue;
+            }
+        }
+
         if (in.hazard) { note_refusal(word); st->refused++; continue; }
 
         unsigned a, b;

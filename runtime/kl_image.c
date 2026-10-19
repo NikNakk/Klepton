@@ -113,6 +113,10 @@ static void *x18_img_data_at(void *vctx, uint64_t va, size_t len) {
 #define R_AARCH64_JUMP_SLOT 1026
 #define R_AARCH64_RELATIVE  1027
 #define STB_WEAK 2
+#define PT_TLS 7
+#define R_AARCH64_TLS_TPREL64 1030
+#define R_AARCH64_TLSDESC 1031
+#define STT_TLS 6
 
 struct kl_image {
     uint8_t   *base;        // ELF vaddr V lives at base + V (V relative to the
@@ -141,6 +145,7 @@ struct kl_image {
     unsigned    missing_n, missing_cap;
     const char **weak;         // ...and the weak ones, deliberately left NULL
     unsigned    weak_n, weak_cap;
+    kl_tls_module *tls;        // PT_TLS, registered with kl_tls.c (glibc guests)
     void       *dl_handle;     // set when the image arrived as a translated
                                // Mach-O dylib; then dyld owns the mapping
 };
@@ -368,13 +373,30 @@ static uint32_t *gp_at(void *ctx, uint64_t va) {
     return (uint32_t *)(c->base + (va - c->lo));
 }
 
+// A `svc #0` with no x8 write in the six words before it (any instruction
+// whose destination register is x8/w8).
+static int kl_svc_is_bare(const uint32_t *w, size_t i) {
+    for (size_t k = 1; k <= 6 && k <= i; k++)
+        if ((w[i - k] & 0x1fu) == 8u) return 0;
+    return 1;
+}
+
 static void rewrite_tls(uint8_t *p, size_t n, uint64_t va, const char *path,
                         kl_stats *st) {
     uint32_t *w = (uint32_t *)p;
     size_t words = n / 4;
     for (size_t i = 0; i < words; i++) {
+        if (w[i] == 0xd4000001u && kl_svc_is_bare(w, i)) {
+            static int said;
+            if (!said++) fprintf(stderr, "  [klepton] %s: bare svc #0 (no syscall number) at +0x%llx and "
+                                         "others -> nop (Darwin would run syscall x16)\n",
+                                 path, (unsigned long long)(va + i * 4));
+            w[i] = 0xd503201fu;
+            st->svc_sites++;
+            continue;
+        }
         if ((w[i] & 0xffffffe0u) == 0xd53bd040u) {
-            if (kl_x18_is_data(w, n, i)) {
+            if (!kl_env_on("KL_TLS_REWRITE_FORCE", 0) && kl_x18_is_data(w, n, i)) {
                 st->tls_refused++;
                 fprintf(stderr, "  [klepton] %s: TLS site at +0x%llx left alone — its "
                                 "neighbourhood reads as data. If it IS code, "
@@ -392,14 +414,20 @@ static void rewrite_tls(uint8_t *p, size_t n, uint64_t va, const char *path,
 // Registered interposers, consulted for defined and undefined symbols alike.
 // Small and fixed: this is an instrument, and a table that has to grow is a sign
 // the question being asked wants a different tool.
-static struct { const char *name; void *fn; } g_interpose[8];
+static struct { const char *name; void *fn; } g_interpose[64];
 static unsigned g_interpose_n;
 
 void kl_interpose(const char *name, void *fn) {
-    if (!name || !fn || g_interpose_n >= 8) return;
+    if (!name || !fn || g_interpose_n >= 64) return;
     g_interpose[g_interpose_n].name = name;
     g_interpose[g_interpose_n].fn = fn;
     g_interpose_n++;
+}
+
+void *kl_interpose_lookup(const char *name) {
+    for (unsigned i = 0; i < g_interpose_n; i++)
+        if (!strcmp(name, g_interpose[i].name)) return g_interpose[i].fn;
+    return NULL;
 }
 
 static uint64_t sym_value(kl_image *img, uint32_t idx, const char **name_out) {
@@ -469,6 +497,38 @@ static int apply_relocs(kl_image *img, const Elf64_Rela *r, size_t count) {
             if (type == R_AARCH64_ABS64) img->stats.abs64++;
             else if (type == R_AARCH64_GLOB_DAT) img->stats.glob_dat++;
             else img->stats.jump_slot++;
+            break;
+        }
+        case R_AARCH64_TLS_TPREL64:
+        case R_AARCH64_TLSDESC: {
+            // ELF TLS (glibc guests). The symbol, if any, is an STT_TLS whose
+            // value is an offset inside its module's TLS block — this image's
+            // when defined here, another loaded image's when imported.
+            kl_tls_module *m = img->tls;
+            uint64_t off = 0;
+            if (sidx) {
+                const Elf64_Sym *s = &img->symtab[sidx];
+                nm = img->strtab + s->st_name;
+                if (s->st_shndx != 0) off = s->st_value;
+                else if (kl_guest_tls_sym_global(nm, &m, &off) != 0) m = NULL;
+            }
+            if (!m) {
+                img->stats.imports_missing++;
+                record_missing(img, nm ? nm : "(TLS without PT_TLS)");
+                if (type == R_AARCH64_TLSDESC) { slot[0] = (uint64_t)(uintptr_t)unresolved_stub(nm ? nm : "tlsdesc"); slot[1] = 0; }
+                else *slot = 0;
+                break;
+            }
+            off += (uint64_t)r->r_addend;
+            if (type == R_AARCH64_TLS_TPREL64) {
+                uint64_t v;
+                if (kl_tls_tprel(m, off, &v) != 0) { err("%s: %s", img->path, kl_tls_error()); return -1; }
+                *slot = v;
+                img->stats.tls_tprel++;
+            } else {
+                kl_tls_desc(m, off, slot);
+                img->stats.tls_desc++;
+            }
             break;
         }
         default:
@@ -592,6 +652,24 @@ static int bind_dynamic(kl_image *img, const Elf64_Phdr *ph, int phnum, uint64_t
         }
     }
     if (!img->symtab || !img->strtab) { err("missing DT_SYMTAB/DT_STRTAB"); return -1; }
+
+    // PT_TLS: register the module's thread-local block before any TLS
+    // relocation asks for an offset into it. A module with TPREL64 relocations
+    // needs TP-relative placement; everything else goes in the per-thread block.
+    for (int i = 0; i < phnum; i++) {
+        if (ph[i].p_type != PT_TLS) continue;
+        int fixed = 0;
+        const Elf64_Rela *tabs[2] = { rela, jmprel };
+        size_t cnts[2] = { relasz / sizeof(Elf64_Rela), pltsz / sizeof(Elf64_Rela) };
+        for (int t = 0; t < 2 && !fixed; t++)
+            for (size_t k = 0; tabs[t] && k < cnts[t]; k++)
+                if (ELF64_R_TYPE(tabs[t][k].r_info) == R_AARCH64_TLS_TPREL64) { fixed = 1; break; }
+        img->tls = kl_tls_register(img->path, img->base + ph[i].p_vaddr - lo,
+                                   (size_t)ph[i].p_filesz, (size_t)ph[i].p_memsz,
+                                   (size_t)ph[i].p_align, fixed);
+        if (!img->tls) { err("%s: %s", img->path, kl_tls_error()); return -1; }
+        break;
+    }
 
     // Order is independent — RELA, RELR and APS2 relocate disjoint slots — but
     // every relative table must run before kl_run_init: the .init_array pointers
@@ -1321,8 +1399,24 @@ kl_image *kl_load(const char *path) {
 }
 
 void kl_run_init(kl_image *img) {
-    for (size_t i = 0; i < img->init_count; i++)
-        if (img->init_array[i]) img->init_array[i]();
+    int trace = kl_env_on("KL_TRACE_INIT", 0);
+    for (size_t i = 0; i < img->init_count; i++) {
+        if (!img->init_array[i]) continue;
+        if (trace) fprintf(stderr, "  [init] %s [%zu/%zu] -> +%#llx\n", img->path, i, img->init_count,
+                           (unsigned long long)((const uint8_t *)img->init_array[i] - img->base));
+        // KL_INIT_SLEEP=<basename>:<index>:<ms> pauses before that constructor; KL_INIT_SKIP=<basename>:<index> skips it.
+        { const char *sl = getenv("KL_INIT_SLEEP"); const char *sk = getenv("KL_INIT_SKIP");
+          const char *b = strrchr(img->path, '/'); b = b ? b + 1 : img->path;
+          if (sl) { const char *c1 = strchr(sl, ':'); const char *c2 = c1 ? strchr(c1 + 1, ':') : NULL;
+                    if (c1 && c2 && (size_t)(c1 - sl) == strlen(b) && !strncmp(sl, b, strlen(b)) && (size_t)atoi(c1 + 1) == i) usleep((useconds_t)atoi(c2 + 1) * 1000); }
+          if (sk) { const char *c1 = strrchr(sk, ':');
+                    if (c1 && (size_t)(c1 - sk) == strlen(b) && !strncmp(sk, b, strlen(b)) && (size_t)atoi(c1 + 1) == i) { fprintf(stderr, "  [init] skipping %s [%zu]\n", b, i); continue; } } }
+        // KL_INIT_BREAK=<basename>:<index> traps into the debugger just before that constructor.
+        { const char *brk = getenv("KL_INIT_BREAK");
+          if (brk) { const char *colon = strrchr(brk, ':'); const char *b = strrchr(img->path, '/'); b = b ? b + 1 : img->path;
+                     if (colon && (size_t)(colon - brk) == strlen(b) && !strncmp(brk, b, strlen(b)) && (size_t)atoi(colon + 1) == i) __builtin_debugtrap(); } }
+        img->init_array[i]();
+    }
 }
 
 void *kl_sym(kl_image *img, const char *name) {
@@ -1350,6 +1444,7 @@ void *kl_sym(kl_image *img, const char *name) {
     for (size_t i = 0; i < n; i++) {
         const Elf64_Sym *s = &img->symtab[i];
         if ((const char *)(s + 1) > hi_p) break;             // past the mapping
+        if ((s->st_info & 0xf) == STT_TLS) continue;         // an offset, not an address: kl_sym_tls
         if (s->st_shndx == 0 || !s->st_name) continue;
         const char *nm = img->strtab + s->st_name;
         if (nm < lo_p || nm >= hi_p) continue;               // not a real name
@@ -1357,6 +1452,83 @@ void *kl_sym(kl_image *img, const char *name) {
             return img->base + s->st_value;
     }
     return NULL;
+}
+
+int kl_sym_tls(kl_image *img, const char *name, uint64_t *off) {
+    if (!img || !img->tls) return -1;
+    size_t n = img->nsyms;
+    if (!n) n = ((const char *)img->strtab - (const char *)img->symtab) / sizeof(Elf64_Sym);
+    const char *lo_p = (const char *)img->base, *hi_p = lo_p + img->span;
+    for (size_t i = 0; i < n; i++) {
+        const Elf64_Sym *s = &img->symtab[i];
+        if ((const char *)(s + 1) > hi_p) break;
+        if (s->st_shndx == 0 || !s->st_name || (s->st_info & 0xf) != STT_TLS) continue;
+        const char *nm = img->strtab + s->st_name;
+        if (nm < lo_p || nm >= hi_p) continue;
+        if (strcmp(nm, name) == 0) { if (off) *off = s->st_value; return 0; }
+    }
+    return -1;
+}
+
+kl_tls_module *kl_image_tls_module(kl_image *img) { return img ? img->tls : NULL; }
+
+// Bind again the imports that were unresolved when this image was relocated:
+// a dependency cycle loads one side before the other exists. Only the names in
+// the missing list are touched; GOT pages that RELRO made read-only are opened.
+int kl_rebind_missing(kl_image *img) {
+    if (!img || !img->missing_n || !img->symtab || !img->strtab) return 0;
+    unsigned phnum = 0;
+    const Elf64_Phdr *ph = (const Elf64_Phdr *)kl_phdrs(img, &phnum);
+    if (!ph) return 0;
+    uint64_t lo = UINT64_MAX;
+    for (unsigned i = 0; i < phnum; i++) if (ph[i].p_type == PT_LOAD && ph[i].p_vaddr < lo) lo = ph[i].p_vaddr;
+    if (lo == UINT64_MAX) lo = 0;
+    const Elf64_Rela *tabs[2] = { NULL, NULL }; size_t cnts[2] = { 0, 0 };
+    for (unsigned i = 0; i < phnum; i++) {
+        if (ph[i].p_type != PT_DYNAMIC) continue;
+        for (const Elf64_Dyn *dp = (const Elf64_Dyn *)(img->base + ph[i].p_vaddr - lo); dp->d_tag != DT_NULL; dp++) {
+            if (dp->d_tag == DT_RELA) tabs[0] = (const Elf64_Rela *)(img->base + dp->d_val);
+            else if (dp->d_tag == DT_RELASZ) cnts[0] = dp->d_val / sizeof(Elf64_Rela);
+            else if (dp->d_tag == DT_JMPREL) tabs[1] = (const Elf64_Rela *)(img->base + dp->d_val);
+            else if (dp->d_tag == DT_PLTRELSZ) cnts[1] = dp->d_val / sizeof(Elf64_Rela);
+        }
+    }
+    int fixed = 0;
+    const uintptr_t pg = (uintptr_t)getpagesize();
+    for (int t = 0; t < 2; t++) {
+        for (size_t k = 0; tabs[t] && k < cnts[t]; k++) {
+            const Elf64_Rela *r = &tabs[t][k];
+            uint32_t type = ELF64_R_TYPE(r->r_info), sidx = ELF64_R_SYM(r->r_info);
+            if (!sidx || (type != R_AARCH64_ABS64 && type != R_AARCH64_GLOB_DAT && type != R_AARCH64_JUMP_SLOT)) continue;
+            const Elf64_Sym *s = &img->symtab[sidx];
+            if (s->st_shndx != 0) continue;
+            const char *nm = img->strtab + s->st_name;
+            unsigned m;
+            for (m = 0; m < img->missing_n; m++) if (!strcmp(img->missing[m], nm)) break;
+            if (m == img->missing_n) continue;
+            void *v = kl_shim_lookup(nm);
+            if (!v) v = kl_guest_sym_global(nm);
+            if (!v) continue;
+            uint64_t *slot = (uint64_t *)(img->base + r->r_offset);
+            mprotect((void *)((uintptr_t)slot & ~(pg - 1)), pg, PROT_READ | PROT_WRITE);
+            *slot = (uint64_t)(uintptr_t)v + (uint64_t)r->r_addend;
+            fixed++;
+        }
+    }
+    if (fixed) {
+        // Drop the names that now resolve.
+        unsigned w = 0;
+        for (unsigned m = 0; m < img->missing_n; m++) {
+            const char *nm = img->missing[m];
+            if (kl_shim_lookup(nm) || kl_guest_sym_global(nm)) continue;
+            img->missing[w++] = nm;
+        }
+        img->missing_n = w;
+        img->stats.imports_bound += (unsigned)fixed;
+        if (kl_env_on("KL_TRACE_NEEDED", 1))
+            fprintf(stderr, "  [dl] %s: %d import(s) bound late (dependency cycle)\n", img->path, fixed);
+    }
+    return fixed;
 }
 
 void kl_unload(kl_image *img) {

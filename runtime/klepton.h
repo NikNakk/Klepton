@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include "kl_env.h"
+#include "kl_tls.h"
 
 typedef struct kl_image kl_image;
 
@@ -45,9 +46,14 @@ void      *kl_sym(kl_image *img, const char *name);
 // is how an interposer calls through. Diagnostic: nothing in a shipping path
 // registers one.
 void       kl_interpose(const char *name, void *fn);
+// Called once per image right after it is registered (before guest code
+// of a later dlopen can run it); the host uses it for byte-checked fixes.
+extern void (*kl_image_loaded_hook)(const char *path, kl_image *img);
+void      *kl_interpose_lookup(const char *name);   // an interposer by name, or NULL
 // Run DT_INIT_ARRAY. Separate from kl_load so tests can inspect first.
 void       kl_run_init(kl_image *img);
 void       kl_unload(kl_image *img);
+int        kl_rebind_missing(kl_image *img);   // bind imports that missed (dependency cycles)
 const char *kl_error(void);
 
 // Base address the image was mapped at, and its total vaddr span.
@@ -87,6 +93,7 @@ typedef struct {
     // veneer machinery, counted apart because the x18 numbers above are exact
     // and `make check` gates on them.
     unsigned ctr_sites, ctr_patched, ctr_refused;
+    unsigned tls_desc, tls_tprel;                    // ELF TLS relocations (glibc guests)
 } kl_stats;
 const kl_stats *kl_get_stats(kl_image *img);
 
@@ -130,6 +137,12 @@ int       kl_list_needed(const char *path, char names[][128], int max);
 // Search every registered guest image for an export (kl_dl.c); used by the
 // loader's import binding after the shim misses.
 void     *kl_guest_sym_global(const char *name);
+// ELF TLS symbols: a defined STT_TLS symbol's offset inside its module's block.
+int       kl_sym_tls(kl_image *img, const char *name, uint64_t *off);
+kl_tls_module *kl_image_tls_module(kl_image *img);
+int       kl_guest_tls_sym_global(const char *name, kl_tls_module **m, uint64_t *off);
+// A host-implemented library for the guest, by dlopen path suffix ("/vrclient.so").
+void      kl_dl_add_host_module(const char *suffix, void *(*lookup)(const char *));
 // The image's program headers, as mapped. Every guest lib's first PT_LOAD maps
 // file offset 0 at vaddr 0, so the phdr array is live at base + e_phoff and the
 // load bias is simply the base. This is what dl_iterate_phdr hands the guest's

@@ -463,7 +463,7 @@ static VkResult klvk_EnumerateInstanceExtensionProperties(
 
     uint32_t n = 0;
     real(layer, &n, NULL);
-    VkExtensionProperties *tmp = calloc(n + 2, sizeof *tmp);
+    VkExtensionProperties *tmp = calloc(n + 8, sizeof *tmp);
     if (!tmp) return VK_ERROR_OUT_OF_HOST_MEMORY;
     real(layer, &n, tmp);
 
@@ -475,6 +475,18 @@ static VkResult klvk_EnumerateInstanceExtensionProperties(
                  VK_KHR_ANDROID_SURFACE_EXTENSION_NAME);
         tmp[n].specVersion = 6;
         n++;
+    }
+    // ...and the Linux window-system surfaces, for a Linux guest (Source 2 asks
+    // for xcb/xlib/wayland and fails Vulkan init without one). Same synthetic
+    // surface behind all of them.
+    if (!layer) {
+        static const char *linux_wsi[] = { "VK_KHR_xcb_surface", "VK_KHR_xlib_surface", "VK_KHR_wayland_surface" };
+        for (unsigned k = 0; k < 3; k++)
+            if (!ext_supported(tmp, n, linux_wsi[k])) {
+                snprintf(tmp[n].extensionName, sizeof tmp[n].extensionName, "%s", linux_wsi[k]);
+                tmp[n].specVersion = 6;
+                n++;
+            }
     }
 
     VkResult r = VK_SUCCESS;
@@ -508,7 +520,8 @@ static VkResult klvk_CreateInstance(const VkInstanceCreateInfo *ci,
     extlist keep = {{0}, 0};
     for (uint32_t i = 0; ci && i < ci->enabledExtensionCount; i++) {
         const char *e = ci->ppEnabledExtensionNames[i];
-        if (!strcmp(e, VK_KHR_ANDROID_SURFACE_EXTENSION_NAME)) {
+        if (!strcmp(e, VK_KHR_ANDROID_SURFACE_EXTENSION_NAME) || !strcmp(e, "VK_KHR_xcb_surface") ||
+            !strcmp(e, "VK_KHR_xlib_surface") || !strcmp(e, "VK_KHR_wayland_surface")) {
             VKT("instance ext %s -> ours (MoltenVK has no Android WSI)\n", e);
             continue;
         }
@@ -591,6 +604,117 @@ static void dev_resolve(klvk_device *d) {
 #undef R
 }
 
+// Every feature struct is { sType, pNext, VkBool32... }; knowing a struct's size
+// is enough to query what the device supports (vkGetPhysicalDeviceFeatures2 with
+// a zeroed copy chained) and AND the request against it.
+static const struct { VkStructureType st; size_t size; const char *name; } klvk_feature_structs[] = {
+#define FS(T, ST) { ST, sizeof(T), #T }
+    FS(VkPhysicalDeviceVulkan11Features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES),
+    FS(VkPhysicalDeviceVulkan12Features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES),
+    FS(VkPhysicalDeviceVulkan13Features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES),
+    FS(VkPhysicalDeviceMultiviewFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES),
+    FS(VkPhysicalDevice16BitStorageFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES),
+    FS(VkPhysicalDevice8BitStorageFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES),
+    FS(VkPhysicalDeviceShaderFloat16Int8Features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES),
+    FS(VkPhysicalDeviceDynamicRenderingFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES),
+    FS(VkPhysicalDeviceDynamicRenderingLocalReadFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES),
+    FS(VkPhysicalDeviceExtendedDynamicStateFeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT),
+    FS(VkPhysicalDeviceExtendedDynamicState2FeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT),
+    FS(VkPhysicalDeviceExtendedDynamicState3FeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT),
+    FS(VkPhysicalDeviceHostImageCopyFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES),
+    FS(VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES),
+    FS(VkPhysicalDeviceImagelessFramebufferFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES),
+    FS(VkPhysicalDeviceDescriptorIndexingFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES),
+    FS(VkPhysicalDeviceBufferDeviceAddressFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES),
+    FS(VkPhysicalDeviceTimelineSemaphoreFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES),
+    FS(VkPhysicalDeviceShaderDrawParametersFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES),
+    FS(VkPhysicalDeviceSamplerYcbcrConversionFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES),
+    FS(VkPhysicalDeviceVariablePointersFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES),
+    FS(VkPhysicalDeviceUniformBufferStandardLayoutFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES),
+    FS(VkPhysicalDeviceScalarBlockLayoutFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES),
+    FS(VkPhysicalDeviceHostQueryResetFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES),
+    FS(VkPhysicalDeviceVulkanMemoryModelFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES),
+    FS(VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES),
+    FS(VkPhysicalDeviceShaderAtomicInt64Features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES),
+    FS(VkPhysicalDeviceFragmentDensityMapFeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT),
+    FS(VkPhysicalDeviceMemoryPriorityFeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT),
+    FS(VkPhysicalDeviceRobustness2FeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT),
+    FS(VkPhysicalDeviceSynchronization2Features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES),
+    FS(VkPhysicalDeviceMaintenance4Features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES),
+    FS(VkPhysicalDeviceShaderDemoteToHelperInvocationFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES),
+    FS(VkPhysicalDeviceImageRobustnessFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES),
+    FS(VkPhysicalDeviceInlineUniformBlockFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_FEATURES),
+    FS(VkPhysicalDevicePipelineCreationCacheControlFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES),
+    FS(VkPhysicalDevicePrivateDataFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIVATE_DATA_FEATURES),
+    FS(VkPhysicalDeviceShaderIntegerDotProductFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES),
+    FS(VkPhysicalDeviceShaderTerminateInvocationFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_TERMINATE_INVOCATION_FEATURES),
+    FS(VkPhysicalDeviceSubgroupSizeControlFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES),
+    FS(VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES),
+    FS(VkPhysicalDeviceCustomBorderColorFeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT),
+    FS(VkPhysicalDeviceIndexTypeUint8Features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES),
+    FS(VkPhysicalDeviceLineRasterizationFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES),
+    FS(VkPhysicalDeviceVertexAttributeDivisorFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES),
+    FS(VkPhysicalDeviceDepthClipEnableFeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT),
+    FS(VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT),
+    FS(VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT),
+    FS(VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT),
+    FS(VkPhysicalDeviceTextureCompressionASTCHDRFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXTURE_COMPRESSION_ASTC_HDR_FEATURES),
+    FS(VkPhysicalDeviceMultiDrawFeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT),
+    FS(VkPhysicalDeviceDepthClampZeroOneFeaturesKHR, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLAMP_ZERO_ONE_FEATURES_KHR),
+    FS(VkPhysicalDeviceShaderClockFeaturesKHR, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR),
+    FS(VkPhysicalDeviceConditionalRenderingFeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT),
+    FS(VkPhysicalDeviceTransformFeedbackFeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT),
+    FS(VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT),
+    FS(VkPhysicalDeviceShaderAtomicFloatFeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT),
+    FS(VkPhysicalDeviceMaintenance5Features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES),
+    FS(VkPhysicalDeviceMaintenance6Features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES),
+#undef FS
+};
+static size_t klvk_feature_struct_size(VkStructureType st, const char **name) {
+    for (size_t i = 0; i < sizeof klvk_feature_structs / sizeof *klvk_feature_structs; i++)
+        if (klvk_feature_structs[i].st == st) { if (name) *name = klvk_feature_structs[i].name; return klvk_feature_structs[i].size; }
+    return 0;
+}
+// AND the requested features (pEnabledFeatures and every known feature struct in
+// the pNext chain, which is modified in place: it is the guest's memory, but a
+// bit the device lacks could never have been honoured) against what MoltenVK
+// reports. Returns the number of features turned off.
+static unsigned klvk_clamp_features(VkPhysicalDevice phys, VkDeviceCreateInfo *ci) {
+    PFN_vkGetPhysicalDeviceFeatures gf = (PFN_vkGetPhysicalDeviceFeatures)real_gipa(g_instance, "vkGetPhysicalDeviceFeatures");
+    PFN_vkGetPhysicalDeviceFeatures2 gf2 = (PFN_vkGetPhysicalDeviceFeatures2)real_gipa(g_instance, "vkGetPhysicalDeviceFeatures2");
+    if (!gf2) gf2 = (PFN_vkGetPhysicalDeviceFeatures2)real_gipa(g_instance, "vkGetPhysicalDeviceFeatures2KHR");
+    unsigned off = 0;
+    VkPhysicalDeviceFeatures have; memset(&have, 0, sizeof have);
+    if (gf) gf(phys, &have);
+    VkBool32 *hb = (VkBool32 *)&have;
+    if (ci->pEnabledFeatures && gf) {
+        VkBool32 *rb = (VkBool32 *)ci->pEnabledFeatures;
+        for (size_t i = 0; i < sizeof have / sizeof(VkBool32); i++)
+            if (rb[i] && !hb[i]) { rb[i] = VK_FALSE; off++; VKI("device feature #%zu (VkPhysicalDeviceFeatures) not supported — turned off\n", i); }
+    }
+    for (VkBaseOutStructure *p = (VkBaseOutStructure *)ci->pNext; p; p = p->pNext) {
+        if (p->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
+            VkBool32 *rb = (VkBool32 *)&((VkPhysicalDeviceFeatures2 *)p)->features;
+            for (size_t i = 0; gf && i < sizeof have / sizeof(VkBool32); i++)
+                if (rb[i] && !hb[i]) { rb[i] = VK_FALSE; off++; VKI("device feature #%zu (VkPhysicalDeviceFeatures2) not supported — turned off\n", i); }
+            continue;
+        }
+        const char *name = NULL;
+        size_t size = klvk_feature_struct_size(p->sType, &name);
+        if (!size || !gf2) continue;
+        uint8_t *probe = calloc(1, size);
+        if (!probe) continue;
+        ((VkBaseOutStructure *)probe)->sType = p->sType;
+        VkPhysicalDeviceFeatures2 q = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, probe };
+        gf2(phys, &q);
+        VkBool32 *rb = (VkBool32 *)((uint8_t *)p + 16), *sb = (VkBool32 *)(probe + 16);
+        for (size_t i = 0; i < (size - 16) / sizeof(VkBool32); i++)
+            if (rb[i] && !sb[i]) { rb[i] = VK_FALSE; off++; VKI("device feature %s field #%zu not supported — turned off\n", name, i); }
+        free(probe);
+    }
+    return off;
+}
+
 static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
                                   const VkAllocationCallbacks *alloc, VkDevice *out) {
     PFN_vkCreateDevice real = (PFN_vkCreateDevice)real_gipa(g_instance, "vkCreateDevice");
@@ -642,6 +766,13 @@ static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInf
     mine.ppEnabledLayerNames = NULL;
 
     VkResult r = real(phys, &mine, alloc, out);
+    if (r == VK_ERROR_FEATURE_NOT_PRESENT) {
+        // Source 2 asks for a superset of features and copes with what it
+        // gets; a feature MoltenVK lacks is turned off and the create retried.
+        unsigned off = klvk_clamp_features(phys, &mine);
+        VKI("vkCreateDevice: VK_ERROR_FEATURE_NOT_PRESENT — %u feature(s) turned off, retrying\n", off);
+        r = real(phys, &mine, alloc, out);
+    }
     free(have);
     if (r != VK_SUCCESS) { VKI("vkCreateDevice FAILED %d\n", r); return r; }
 
@@ -684,6 +815,18 @@ static VkResult klvk_CreateAndroidSurfaceKHR(VkInstance inst,
     *out = (VkSurfaceKHR)s;
     VKI("vkCreateAndroidSurfaceKHR -> synthetic surface %ux%u\n", s->w, s->h);
     return VK_SUCCESS;
+}
+
+// The Linux WSI entry points: the create-info is window-system specific and
+// ignored; the surface is the same synthetic one.
+static VkResult klvk_CreateLinuxSurfaceKHR(VkInstance inst, const void *ci,
+        const VkAllocationCallbacks *alloc, VkSurfaceKHR *out) {
+    (void)ci;
+    return klvk_CreateAndroidSurfaceKHR(inst, NULL, alloc, out);
+}
+static VkBool32 klvk_GetPhysicalDeviceLinuxPresentationSupportKHR(VkPhysicalDevice p, uint32_t fam, void *a, void *b) {
+    (void)p; (void)fam; (void)a; (void)b;
+    return VK_TRUE;
 }
 
 static klvk_surface *surf_of(VkSurfaceKHR h) {
@@ -3156,6 +3299,8 @@ static void kl_pipe_report(const char *kind, unsigned n, double dt_ms) {
             g_pipe_gfx, g_pipe_comp, tot, (double)g_pipe_ns / 1e9, kind, n, dt_ms);
     }
 }
+#include "kl_vk_async.inc"
+
 static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines(VkDevice dev,
         VkPipelineCache cache, uint32_t n, const VkGraphicsPipelineCreateInfo *ci,
         const VkAllocationCallbacks *alloc, VkPipeline *out) {
@@ -3227,6 +3372,7 @@ static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines(VkDevice dev,
         }
         fflush(stderr);
     }
+    if (kva_create(dev, n, use, out, real)) { free(mod); free(ias); g_pipe_gfx += n; return VK_SUCCESS; }
     double t0 = kl_pipe_ms();
     VkResult r = real ? real(dev, cache, n, use, alloc, out)
                       : VK_ERROR_INITIALIZATION_FAILED;
@@ -4232,6 +4378,7 @@ static VkResult VKAPI_CALL klvk_BeginCommandBuffer(void *cb, const void *bi) {
     static VkResult (*real)(void *, const void *);
     if (!real && real_gdpa) real = (VkResult (*)(void *, const void *))
         real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkBeginCommandBuffer");
+    kva_set_skip(cb, 0);
     klvk_cb_set_idx(cb, 0);
     fove_sec_begin((VkCommandBuffer)cb);   // a re-recorded secondary no longer carries its old indirect draw
     return real ? real(cb, bi) : VK_ERROR_INITIALIZATION_FAILED;
@@ -4264,6 +4411,7 @@ static void VKAPI_CALL klvk_CmdDrawIndexed(void *cb, uint32_t indexCount,
     static void (*real)(void *, uint32_t, uint32_t, uint32_t, int32_t, uint32_t);
     if (!real && real_gdpa) real = (void (*)(void *, uint32_t, uint32_t, uint32_t, int32_t, uint32_t))
         real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkCmdDrawIndexed");
+    if (kva_skip(cb)) return;
     // KL_VK_DRAW_GUARD (default OFF): the skip below drops a draw whenever it
     // cannot find a live MTLBuffer for the index binding. That decision rests on
     // g_cb_idx, a 64-slot, UNLOCKED table that is never drained (no
@@ -4304,6 +4452,11 @@ static void VKAPI_CALL klvk_CmdBindPipeline(void *cb, uint32_t bindPoint, uint64
     static void (*real)(void *, uint32_t, uint64_t);
     if (!real && real_gdpa) real = (void (*)(void *, uint32_t, uint64_t))
         real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkCmdBindPipeline");
+    {   // async pipelines: a placeholder still compiling binds nothing (draws skipped)
+        uint64_t b = kva_bind(cb, bindPoint, pipeline);
+        if (!b && pipeline && kva_of(pipeline)) return;
+        pipeline = b;
+    }
     if (!pipeline) { static int said; if (said < 8) { said++;
         VKI("vkCmdBindPipeline: NULL pipeline bound (bindPoint %u) — a following "
             "draw will dereference null in MoltenVK\n", bindPoint); } }
@@ -6922,6 +7075,12 @@ static const entry g_ours[] = {
     E(EnumeratePhysicalDevices),
     E(CreateDevice),
     E(CreateAndroidSurfaceKHR), E(DestroySurfaceKHR),
+    { "vkCreateXcbSurfaceKHR", (PFN_vkVoidFunction)klvk_CreateLinuxSurfaceKHR },
+    { "vkCreateXlibSurfaceKHR", (PFN_vkVoidFunction)klvk_CreateLinuxSurfaceKHR },
+    { "vkCreateWaylandSurfaceKHR", (PFN_vkVoidFunction)klvk_CreateLinuxSurfaceKHR },
+    { "vkGetPhysicalDeviceXcbPresentationSupportKHR", (PFN_vkVoidFunction)klvk_GetPhysicalDeviceLinuxPresentationSupportKHR },
+    { "vkGetPhysicalDeviceXlibPresentationSupportKHR", (PFN_vkVoidFunction)klvk_GetPhysicalDeviceLinuxPresentationSupportKHR },
+    { "vkGetPhysicalDeviceWaylandPresentationSupportKHR", (PFN_vkVoidFunction)klvk_GetPhysicalDeviceLinuxPresentationSupportKHR },
     E(GetPhysicalDeviceSurfaceSupportKHR), E(GetPhysicalDeviceSurfaceCapabilitiesKHR),
     E(GetPhysicalDeviceSurfaceFormatsKHR), E(GetPhysicalDeviceSurfacePresentModesKHR),
     E(CreateSwapchainKHR), E(DestroySwapchainKHR), E(GetSwapchainImagesKHR),
@@ -6961,6 +7120,12 @@ static const entry g_ours[] = {
     E(CmdBlitImage), E(CmdResolveImage), E(CmdClearColorImage),
     E(CmdCopyBufferToImage), E(CmdCopyImageToBuffer), E(CmdPipelineBarrier),
     E(CreateGraphicsPipelines), E(CreateComputePipelines),
+    E(CmdDraw), E(CmdDrawIndirect), E(CmdDrawIndexedIndirect),
+    E(CmdDrawIndirectCount), E(CmdDrawIndexedIndirectCount),
+    { "vkCmdDrawIndirectCountKHR", (PFN_vkVoidFunction)klvk_CmdDrawIndirectCount },
+    { "vkCmdDrawIndexedIndirectCountKHR", (PFN_vkVoidFunction)klvk_CmdDrawIndexedIndirectCount },
+    E(DestroyPipeline), E(DestroyShaderModule), E(DestroyPipelineLayout),
+    E(DestroyRenderPass), E(DestroyDescriptorSetLayout),
     E(CreateFramebuffer), E(CmdBeginRenderPass),
     E(CmdBeginRenderPass2),
     { "vkCmdBeginRenderPass2KHR", (PFN_vkVoidFunction)klvk_CmdBeginRenderPass2 },

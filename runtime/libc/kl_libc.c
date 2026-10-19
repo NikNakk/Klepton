@@ -1651,6 +1651,27 @@ static void proc_build(void) {
         snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/cpu_capacity", i);
         proc_put(rel, "1024\n");
     }
+    {
+        int perf = 0; size_t sz = sizeof perf;
+        if (sysctlbyname("hw.perflevel0.logicalcpu", &perf, &sz, NULL, 0) != 0 || perf <= 0 || perf > ncpu) perf = (int)ncpu;
+        char sib[64];
+        if (ncpu > 1) snprintf(sib, sizeof sib, "0-%ld\n", ncpu - 1); else snprintf(sib, sizeof sib, "0\n");
+        for (long i = 0; i < ncpu; i++) {
+            char rel[256], val[32];
+            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/core_id", i);
+            snprintf(val, sizeof val, "%ld\n", i); proc_put(rel, val);
+            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/physical_package_id", i);
+            proc_put(rel, "0\n");
+            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/thread_siblings_list", i);
+            proc_put(rel, val);
+            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/core_siblings_list", i);
+            proc_put(rel, sib);
+            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/package_cpus_list", i);
+            proc_put(rel, sib);
+            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/cpu_capacity", i);
+            proc_put(rel, i < perf ? "1024\n" : "400\n");          // performance cores first
+        }
+    }
     // Some guests size their core loop from kernel_max (highest possible CPU
     // index) rather than from /possible. Pin it to the last slot we serve so the
     // loop's upper bound and the nodes that exist agree.

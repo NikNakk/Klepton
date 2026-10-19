@@ -97,6 +97,7 @@ static uint64_t g_canary = 0x0000BEEFCAFE0000ULL;
 void kl_thread_init(void) {
     uint64_t tp; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tp));
     ((uint64_t *)tp)[TLS_SLOT_STACK_GUARD] = g_canary;
+    kl_tls_thread_init();
 }
 
 // The guest installs its own fatal-signal handlers — IL2CPP does this for crash
