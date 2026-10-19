@@ -696,6 +696,11 @@ static int bind_dynamic(kl_image *img, const Elf64_Phdr *ph, int phnum, uint64_t
 // list. dlsym would be the obvious route and is precisely what we cannot use —
 // the translated dylib deliberately exports nothing.
 kl_image *kl_load_dylib(const char *path) {
+    const char *svc_policy = getenv("KL_SVC_POLICY");
+    if (svc_policy && strcmp(svc_policy, "legacy")) {
+        err("KL_SVC_POLICY rejects pretranslated Mach-O images; use audited runtime ELF");
+        return NULL;
+    }
     char real[PATH_MAX];
     if (!realpath(path, real)) snprintf(real, sizeof real, "%s", path);
 
@@ -1093,11 +1098,41 @@ static int protect_pages(kl_image *img, const Elf64_Ehdr *eh, const Elf64_Phdr *
     return 0;
 }
 
+// Conservative execution gate, not a syscall emulator. Scan file-backed
+// executable LOAD bytes before allocating/relocating any guest mapping. Data
+// inside those segments can cause false positives; refusal is intentional.
+static int reject_raw_svc(const uint8_t *file, size_t size, const Elf64_Ehdr *eh) {
+    const char *policy = getenv("KL_SVC_POLICY");
+    if (!policy || !strcmp(policy, "legacy")) return 0;
+    if (strcmp(policy, "reject")) { err("unknown KL_SVC_POLICY (use legacy or reject)"); return -1; }
+    if (eh->e_phentsize != sizeof(Elf64_Phdr) || eh->e_phoff > size ||
+        eh->e_phnum > (size - eh->e_phoff) / sizeof(Elf64_Phdr)) {
+        err("SVC preflight: invalid program headers"); return -1;
+    }
+    const Elf64_Phdr *ph = (const Elf64_Phdr *)(file + eh->e_phoff);
+    for (unsigned i = 0; i < eh->e_phnum; ++i) {
+        if (ph[i].p_type != PT_LOAD || !(ph[i].p_flags & PF_X)) continue;
+        if (ph[i].p_offset > size || ph[i].p_filesz > size - ph[i].p_offset) {
+            err("SVC preflight: invalid executable segment"); return -1;
+        }
+        for (uint64_t off = (4 - (ph[i].p_vaddr & 3)) & 3; off + 4 <= ph[i].p_filesz; off += 4) {
+            uint32_t word; memcpy(&word, file + ph[i].p_offset + off, sizeof word);
+            if ((word & 0xffe0001fu) == 0xd4000001u) {
+                err("raw SVC instruction candidate at VA %#llx refused by KL_SVC_POLICY=reject (before guest mapping)",
+                    (unsigned long long)(ph[i].p_vaddr + off));
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
 kl_image *kl_load(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) { err("open %s: %s", path, strerror(errno)); return NULL; }
     struct stat sb;
     if (fstat(fd, &sb) != 0) { err("fstat: %s", strerror(errno)); close(fd); return NULL; }
+    if (sb.st_size < (off_t)sizeof(Elf64_Ehdr)) { err("truncated ELF header"); close(fd); return NULL; }
     uint8_t *file = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (file == MAP_FAILED) { err("mmap file: %s", strerror(errno)); return NULL; }
@@ -1109,6 +1144,7 @@ kl_image *kl_load(const char *path) {
     if (eh->e_machine != 183) { err("not AArch64 (e_machine=%u)", eh->e_machine);
                                 munmap(file, sb.st_size); return NULL; }
 
+    if (reject_raw_svc(file, (size_t)sb.st_size, eh)) { munmap(file, sb.st_size); return NULL; }
     const Elf64_Phdr *ph = (const Elf64_Phdr *)(file + eh->e_phoff);
     uint64_t lo = UINT64_MAX, hi = 0;
     for (int i = 0; i < eh->e_phnum; i++)
