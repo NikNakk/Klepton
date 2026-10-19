@@ -24,7 +24,8 @@ uninitialized output key when choosing a destructor.
 Tests in VeRantyx `NativeARM/host/tests/guest_threads.c` link the real runtime
 and host shims, using host-owned callbacks. They exercise normal return,
 pthread_exit, deferred cancellation, C++ TLS + pthread-key destructors, repeated
-key destructors, detach, interposed syscall(exit), signal-zero tkill/tgkill,
+key destructors, nested/cross-domain destructor registration, detach,
+interposed syscall(exit), signal-zero tkill/tgkill,
 unknown IDs and sequential fast return/exit cycles. No ELF/game is loaded.
 
 Limits before gameplay:
