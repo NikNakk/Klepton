@@ -32,6 +32,7 @@
 #include <time.h>
 #include <dispatch/dispatch.h>
 #include "klepton.h"
+#include "kl_guest_threads.h"
 #include "kl_env.h"
 #include "kl_x18.h"
 
@@ -1013,6 +1014,7 @@ static void tsd_thread_exit(void *p) {
     }
     pthread_setspecific(g_tsd_key, NULL);
     free(s);
+    kl_guest_thread_drop();
 }
 static void tsd_init(void) { pthread_key_create(&g_tsd_key, tsd_thread_exit); }
 // No pthread_once here on purpose: every caller has already passed key_live(),
@@ -1023,7 +1025,10 @@ static kl_tsd_slot *tsd_table(int make) {
     kl_tsd_slot *s = pthread_getspecific(g_tsd_key);
     if (!s && make) {
         s = calloc(KL_MAX_KEYS, sizeof *s);
-        if (s) pthread_setspecific(g_tsd_key, s);
+        if (s) {
+            if (pthread_setspecific(g_tsd_key, s)) { free(s); return NULL; }
+            kl_guest_thread_hold();
+        }
     }
     return s;
 }
@@ -1213,8 +1218,15 @@ void kl_pthread_boost_qos(uint64_t threadid) {
 }
 
 typedef struct { void *(*fn)(void *); void *arg; } tramp;
+static void guest_thread_cleanup(void *unused) {
+    thread_unregister(pthread_self());
+    kl_guest_thread_body_done();
+}
 static void *thread_tramp(void *p) {
     tramp t = *(tramp *)p; free(p);
+    void *r;
+    kl_guest_thread_enter();
+    pthread_cleanup_push(guest_thread_cleanup, NULL);
     kl_thread_init();
     // KL_GUEST_QOS=1: every guest thread at USER_INITIATED instead of default.
     // On visionOS a default-QoS thread is scheduled behind the compositor's
@@ -1261,8 +1273,8 @@ static void *thread_tramp(void *p) {
             pthread_setspecific(KLX_TSD_SLOT, NULL);
         }
     }
-    void *r = t.fn(t.arg);
-    thread_unregister(pthread_self());
+    r = t.fn(t.arg);
+    pthread_cleanup_pop(1);
     return r;
 }
 int klb_pthread_create(pthread_t *out, const bionic_attr *ga,
@@ -1306,7 +1318,7 @@ int klb_pthread_create(pthread_t *out, const bionic_attr *ga,
 }
 int   klb_pthread_join(pthread_t t, void **r)  { return px(pthread_join(t, r)); }
 int   klb_pthread_detach(pthread_t t)          { return px(pthread_detach(t)); }
-void  klb_pthread_exit(void *r)                { thread_unregister(pthread_self()); pthread_exit(r); }
+void  klb_pthread_exit(void *r)                { pthread_exit(r); }
 pthread_t klb_pthread_self(void)               { return pthread_self(); }
 int   klb_pthread_equal(pthread_t a, pthread_t b) { return pthread_equal(a, b); }
 int   klb_pthread_kill(pthread_t t, int sig)   {
