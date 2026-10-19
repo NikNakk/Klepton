@@ -54,7 +54,7 @@ static int claim_slot(unsigned slot, void (*dtor)(void *)) {
     int got = 0;
     for (unsigned i = 0; i < 768; i++) {
         pthread_key_t k;
-        if (pthread_key_create(&k, (unsigned)k == slot ? dtor : NULL) != 0) break;
+        if (pthread_key_create(&k, NULL) != 0) break;
         if ((unsigned)k == slot) {
             // Created without the destructor above (k was unknown before the
             // call); recreate with it when one is wanted.
