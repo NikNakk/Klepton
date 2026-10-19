@@ -1,3 +1,4 @@
+#include "kl_guest_threads.h"
 // libc entry points that cannot be forwarded: divergent struct layouts, Android-only
 // APIs, and functions whose ABI differs between Linux/aarch64 and Darwin/arm64.
 // Everything whose signature *and* layout match is in kl_libc_table.h instead.
@@ -191,7 +192,7 @@ extern char **environ;
 char ***klb_environ_ptr(void) { return &environ; }   // registered as data below
 
 // ---------- Android-only ----------
-int  klb_gettid(void) { uint64_t t = 0; pthread_threadid_np(NULL, &t); return (int)t; }
+int  klb_gettid(void) { kl_guest_thread_enter(); uint64_t t = 0; pthread_threadid_np(NULL, &t); return (int)t; }
 // ---- __system_property_* ----
 //
 // Answering empty for everything is not a neutral answer, it is a SECOND answer

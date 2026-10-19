@@ -1,3 +1,4 @@
+#include "kl_guest_threads.h"
 // ELF TLS for glibc guests — see kl_tls.h.
 #include <stdio.h>
 #include <stdlib.h>
@@ -90,6 +91,7 @@ static void block_destroy(void *p) {
     g_nblocks--;
     pthread_mutex_unlock(&g_mu);
     munmap(b, KL_TLS_BLOCK_BYTES);
+    kl_guest_thread_drop();
 }
 
 static int init_once(void) {
@@ -128,6 +130,7 @@ static struct block *block_get_locked(void) {
     // pthread_setspecific writes the same slot and lets the key's destructor
     // see the value at thread exit.
     pthread_setspecific((pthread_key_t)KL_TLS_BLOCK_SLOT, b);
+    kl_guest_thread_hold();
     return b;
 }
 
