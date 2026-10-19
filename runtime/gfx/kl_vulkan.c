@@ -119,6 +119,13 @@ void *kl_vulkan_xr_image_mtl(unsigned long long img) { (void)img; return NULL; }
 
 #define KLVK_MAX_IMAGES 8
 
+// Opt-in: preserve graphics semantics; only synthetic desktop WSI and
+// Vulkan portability requirements are adapted at this boundary.
+static int strict_enabled;
+static pthread_once_t strict_once = PTHREAD_ONCE_INIT;
+static void strict_configure(void) { strict_enabled = kl_env_on("KL_VK_STRICT", 0); }
+static int vk_strict(void) { pthread_once(&strict_once, strict_configure); return strict_enabled; }
+
 static int vk_trace(void) {
     static int on = -1;
     if (on < 0) on = kl_env_on("KL_VK_TRACE", 0);
@@ -249,7 +256,7 @@ static void vk_init(void) {
         extern const char *kl_driver_target_name(void);
         const char *t = kl_driver_target_name();
         int def = (t && strcmp(t, "wrath2") == 0) ? 1 : 0;
-        if (kl_env_on("KL_MVK_COMPILE_TIMEOUT", def))
+        if (!vk_strict() && kl_env_on("KL_MVK_COMPILE_TIMEOUT", def))
             setenv("MVK_CONFIG_METAL_COMPILE_TIMEOUT", "10000000000", 0); // 10 s
     }
 
@@ -270,7 +277,7 @@ static void vk_init(void) {
         extern const char *kl_driver_target_name(void);
         const char *t = kl_driver_target_name();
         int def = (t && strcmp(t, "wanderer") == 0) ? 1 : 0;
-        if (kl_env_on("KL_MVK_NO_ARGBUF", def))
+        if (!vk_strict() && kl_env_on("KL_MVK_NO_ARGBUF", def))
             setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "0", 0);  // 0 = NEVER
     }
 
@@ -492,11 +499,14 @@ static VkResult klvk_EnumerateInstanceExtensionProperties(
             real_gipa(NULL, "vkEnumerateInstanceExtensionProperties");
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
 
+    if (vk_strict() && layer) return real(layer, count, props);
     uint32_t n = 0;
-    real(layer, &n, NULL);
+    VkResult enumeration = real(layer, &n, NULL);
+    if (vk_strict() && enumeration != VK_SUCCESS) return enumeration;
     VkExtensionProperties *tmp = calloc(n + 8, sizeof *tmp);
     if (!tmp) return VK_ERROR_OUT_OF_HOST_MEMORY;
-    real(layer, &n, tmp);
+    enumeration = real(layer, &n, tmp);
+    if (vk_strict() && enumeration != VK_SUCCESS) { free(tmp); return enumeration; }
 
     // VK_KHR_android_surface is advertised because we implement it. Unity tests
     // for it before enabling it, and a Vulkan build that cannot find a surface
@@ -532,6 +542,54 @@ static VkResult klvk_EnumerateInstanceExtensionProperties(
     return r;
 }
 
+static int synthetic_wsi(const char *name) {
+    return !strcmp(name, "VK_KHR_android_surface") || !strcmp(name, "VK_KHR_xcb_surface") ||
+           !strcmp(name, "VK_KHR_xlib_surface") || !strcmp(name, "VK_KHR_wayland_surface");
+}
+
+// Preserve every requested name (including unknown names) and every caller
+// feature/pNext/layer/API field. Only remove implemented WSI names and append
+// an advertised, required portability extension. No fixed 64-name truncation.
+static const char **strict_extensions(uint32_t n, const char *const *names,
+                                      int instance, uint32_t *used, int *portability) {
+    *used = 0; *portability = 0;
+    const char **result = calloc((size_t)n + 1, sizeof *result);
+    if (!result) return NULL;
+    for (uint32_t i = 0; i < n; ++i)
+        if (!instance || !synthetic_wsi(names[i])) result[(*used)++] = names[i];
+    const char *required = instance ? "VK_KHR_portability_enumeration" : "VK_KHR_portability_subset";
+    for (uint32_t i = 0; i < *used; ++i) if (!strcmp(result[i], required)) {
+        *portability = 1; return result;
+    }
+    return result;
+}
+
+static VkResult strict_instance(const VkInstanceCreateInfo *ci,
+                               const VkAllocationCallbacks *alloc, VkInstance *out) {
+    uint32_t n; int portability;
+    const char **names = strict_extensions(ci->enabledExtensionCount, ci->ppEnabledExtensionNames, 1, &n, &portability);
+    if (!names) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    PFN_vkEnumerateInstanceExtensionProperties enumerate =
+        (PFN_vkEnumerateInstanceExtensionProperties)real_gipa(NULL, "vkEnumerateInstanceExtensionProperties");
+    uint32_t count = 0;
+    VkResult r = enumerate ? enumerate(NULL, &count, NULL) : VK_ERROR_INITIALIZATION_FAILED;
+    VkExtensionProperties *props = r == VK_SUCCESS ? calloc((size_t)count + 1, sizeof *props) : NULL;
+    if (r == VK_SUCCESS && !props) r = VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (r == VK_SUCCESS) r = enumerate(NULL, &count, props);
+    if (r == VK_SUCCESS && !portability && ext_supported(props, count, "VK_KHR_portability_enumeration")) {
+        names[n++] = "VK_KHR_portability_enumeration"; portability = 1;
+    }
+    VkInstanceCreateInfo copy = *ci;
+    copy.enabledExtensionCount = n; copy.ppEnabledExtensionNames = names;
+    if (portability) copy.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    trace_extensions("strict-instance-forwarded", n, names);
+    PFN_vkCreateInstance create = (PFN_vkCreateInstance)real_gipa(NULL, "vkCreateInstance");
+    if (r == VK_SUCCESS) r = create ? create(&copy, alloc, out) : VK_ERROR_INITIALIZATION_FAILED;
+    if (r == VK_SUCCESS) g_instance = *out;
+    free(props); free(names);
+    return r;
+}
+
 static VkResult klvk_CreateInstance(const VkInstanceCreateInfo *ci,
                                     const VkAllocationCallbacks *alloc,
                                     VkInstance *out) {
@@ -543,6 +601,7 @@ static VkResult klvk_CreateInstance(const VkInstanceCreateInfo *ci,
         (PFN_vkEnumerateInstanceExtensionProperties)
             real_gipa(NULL, "vkEnumerateInstanceExtensionProperties");
     if (!real || !enum_ext) return VK_ERROR_INITIALIZATION_FAILED;
+    if (vk_strict()) return strict_instance(ci, alloc, out);
 
     uint32_t nhave = 0;
     enum_ext(NULL, &nhave, NULL);
@@ -747,6 +806,64 @@ static unsigned klvk_clamp_features(VkPhysicalDevice phys, VkDeviceCreateInfo *c
     return off;
 }
 
+static VkResult record_device(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
+                              const VkAllocationCallbacks *alloc, VkDevice *out) {
+    klvk_device *d = calloc(1, sizeof *d);
+    if (!d) {
+        PFN_vkDestroyDevice destroy = (PFN_vkDestroyDevice)real_gdpa(*out, "vkDestroyDevice");
+        if (destroy) destroy(*out, alloc);
+        *out = VK_NULL_HANDLE;
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    d->dev = *out;
+    d->phys = phys;
+    d->queue_family = ci && ci->queueCreateInfoCount ? ci->pQueueCreateInfos[0].queueFamilyIndex : 0;
+    dev_resolve(d);
+    // A queue of our own, for the acquire signal and the capture submit. Taken
+    // from the guest's own first queue family, which is the one it will present
+    // on — see the note in klvk_AcquireNextImageKHR about the sharing.
+    if (d->GetDeviceQueue) d->GetDeviceQueue(d->dev, d->queue_family, 0, &d->queue);
+
+    pthread_mutex_lock(&g_lock);
+    int stored = g_ndev < (int)(sizeof g_devs / sizeof *g_devs);
+    if (stored) g_devs[g_ndev++] = d;
+    pthread_mutex_unlock(&g_lock);
+    if (!stored && vk_strict()) {
+        PFN_vkDestroyDevice destroy = (PFN_vkDestroyDevice)real_gdpa(*out, "vkDestroyDevice");
+        if (destroy) destroy(*out, alloc);
+        free(d); *out = VK_NULL_HANDLE;
+        return VK_ERROR_TOO_MANY_OBJECTS;
+    }
+
+    VKI("vkCreateDevice tracked, queue family %u\n", d->queue_family);
+    return VK_SUCCESS;
+}
+static VkResult strict_device(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
+                              const VkAllocationCallbacks *alloc, VkDevice *out) {
+    PFN_vkCreateDevice create = (PFN_vkCreateDevice)real_gipa(g_instance, "vkCreateDevice");
+    PFN_vkEnumerateDeviceExtensionProperties enumerate =
+        (PFN_vkEnumerateDeviceExtensionProperties)real_gipa(g_instance, "vkEnumerateDeviceExtensionProperties");
+    if (!create || !enumerate) return VK_ERROR_INITIALIZATION_FAILED;
+    uint32_t n, count = 0; int portability;
+    const char **names = strict_extensions(ci->enabledExtensionCount, ci->ppEnabledExtensionNames, 0, &n, &portability);
+    if (!names) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    VkResult r = enumerate(phys, NULL, &count, NULL);
+    VkExtensionProperties *props = r == VK_SUCCESS ? calloc((size_t)count + 1, sizeof *props) : NULL;
+    if (r == VK_SUCCESS && !props) r = VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (r == VK_SUCCESS) r = enumerate(phys, NULL, &count, props);
+    if (r == VK_SUCCESS && !portability && ext_supported(props, count, "VK_KHR_portability_subset"))
+        names[n++] = "VK_KHR_portability_subset";
+    VkDeviceCreateInfo copy = *ci;
+    copy.enabledExtensionCount = n; copy.ppEnabledExtensionNames = names;
+    trace_extensions("strict-device-request", ci->enabledExtensionCount, ci->ppEnabledExtensionNames);
+    trace_chain("strict-device-request", ci->pNext);
+    trace_extensions("strict-device-forwarded", n, names);
+    if (r == VK_SUCCESS) r = create(phys, &copy, alloc, out);
+    free(props); free(names);
+    // In particular: no FEATURE_NOT_PRESENT clamp/retry or mutation of caller pNext.
+    return r == VK_SUCCESS ? record_device(phys, ci, alloc, out) : r;
+}
+
 static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
                                   const VkAllocationCallbacks *alloc, VkDevice *out) {
     PFN_vkCreateDevice real = (PFN_vkCreateDevice)real_gipa(g_instance, "vkCreateDevice");
@@ -754,6 +871,7 @@ static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInf
         (PFN_vkEnumerateDeviceExtensionProperties)
             real_gipa(g_instance, "vkEnumerateDeviceExtensionProperties");
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
+    if (vk_strict()) return strict_device(phys, ci, alloc, out);
     // The whole point of the null-substitution family: Unity reaches here with a
     // NULL physicalDevice (its GPU select left it null), and MoltenVK would make
     // a device on nothing. Give it the real GPU so it gets a working VkDevice.
@@ -812,23 +930,7 @@ static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInf
     free(have);
     if (r != VK_SUCCESS) { VKI("vkCreateDevice FAILED %d\n", r); return r; }
 
-    klvk_device *d = calloc(1, sizeof *d);
-    if (!d) return VK_ERROR_OUT_OF_HOST_MEMORY;
-    d->dev = *out;
-    d->phys = phys;
-    d->queue_family = ci && ci->queueCreateInfoCount ? ci->pQueueCreateInfos[0].queueFamilyIndex : 0;
-    dev_resolve(d);
-    // A queue of our own, for the acquire signal and the capture submit. Taken
-    // from the guest's own first queue family, which is the one it will present
-    // on — see the note in klvk_AcquireNextImageKHR about the sharing.
-    if (d->GetDeviceQueue) d->GetDeviceQueue(d->dev, d->queue_family, 0, &d->queue);
-
-    pthread_mutex_lock(&g_lock);
-    if (g_ndev < (int)(sizeof g_devs / sizeof *g_devs)) g_devs[g_ndev++] = d;
-    pthread_mutex_unlock(&g_lock);
-
-    VKI("vkCreateDevice ok — %u extension(s), queue family %u\n", keep.n, d->queue_family);
-    return VK_SUCCESS;
+    return record_device(phys, ci, alloc, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -6196,7 +6298,35 @@ static const entry g_ours[] = {
 #undef E
 };
 
+static void strict_destroy_device(VkDevice dev, const VkAllocationCallbacks *alloc) {
+    PFN_vkDestroyDevice destroy = (PFN_vkDestroyDevice)real_gdpa(dev, "vkDestroyDevice");
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < g_ndev; ++i) if (g_devs[i]->dev == dev) {
+        free(g_devs[i]); g_devs[i] = g_devs[--g_ndev]; break;
+    }
+    pthread_mutex_unlock(&g_lock);
+    if (destroy) destroy(dev, alloc);
+}
+
 static PFN_vkVoidFunction ours(const char *name) {
+    if (vk_strict()) {
+        if (!strcmp(name, "vkDestroyDevice")) return (PFN_vkVoidFunction)strict_destroy_device;
+        static const char *allowed[] = {
+            "vkCreateInstance", "vkEnumerateInstanceExtensionProperties", "vkCreateDevice",
+            "vkCreateAndroidSurfaceKHR", "vkCreateXcbSurfaceKHR", "vkCreateXlibSurfaceKHR", "vkCreateWaylandSurfaceKHR",
+            "vkDestroySurfaceKHR", "vkGetPhysicalDeviceXcbPresentationSupportKHR",
+            "vkGetPhysicalDeviceXlibPresentationSupportKHR", "vkGetPhysicalDeviceWaylandPresentationSupportKHR",
+            "vkGetPhysicalDeviceSurfaceSupportKHR", "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
+            "vkGetPhysicalDeviceSurfaceFormatsKHR", "vkGetPhysicalDeviceSurfacePresentModesKHR",
+            "vkCreateSwapchainKHR", "vkDestroySwapchainKHR", "vkGetSwapchainImagesKHR",
+            "vkAcquireNextImageKHR", "vkQueuePresentKHR"
+        };
+        int match = 0;
+        for (size_t i = 0; i < sizeof allowed / sizeof *allowed; ++i)
+            if (!strcmp(name, allowed[i])) { match = 1; break; }
+        if (!match) return NULL;
+    }
+
     // KL_TRACE: reveal which render-pass / dynamic-rendering entry points the
     // guest actually resolves, and whether we hand back our wrapper or fall
     // through to the real MoltenVK one. This is how we learn why the compositing
@@ -6253,12 +6383,15 @@ static PFN_vkVoidFunction VKAPI_CALL klvk_GetInstanceProcAddr(VkInstance inst,
     if (!strcmp(name, "vkGetInstanceProcAddr"))
         return (PFN_vkVoidFunction)klvk_GetInstanceProcAddr;
     if (!strcmp(name, "vkGetDeviceProcAddr"))
-        return (PFN_vkVoidFunction)klvk_GetDeviceProcAddr;
+        return vk_strict() && !inst ? NULL : (PFN_vkVoidFunction)klvk_GetDeviceProcAddr;
+    if (vk_strict() && !inst && strcmp(name, "vkCreateInstance") &&
+        strcmp(name, "vkEnumerateInstanceExtensionProperties") &&
+        strcmp(name, "vkEnumerateInstanceLayerProperties") && strcmp(name, "vkEnumerateInstanceVersion")) return NULL;
     PFN_vkVoidFunction m = ours(name);
     if (m) return m;
     if (!g_avail) return NULL;
-    PFN_vkVoidFunction fn = real_gipa(inst ? inst : g_instance, name);
-    if (!fn) { klvk_note_missing(name); return (PFN_vkVoidFunction)klvk_missing_trap; }
+    PFN_vkVoidFunction fn = real_gipa(vk_strict() ? inst : (inst ? inst : g_instance), name);
+    if (!fn && !vk_strict()) { klvk_note_missing(name); return (PFN_vkVoidFunction)klvk_missing_trap; }
     return fn;
 }
 
@@ -6271,10 +6404,13 @@ static PFN_vkVoidFunction VKAPI_CALL klvk_GetDeviceProcAddr(VkDevice dev,
     if (!strcmp(name, "vkGetDeviceProcAddr"))
         return (PFN_vkVoidFunction)klvk_GetDeviceProcAddr;
     PFN_vkVoidFunction m = ours(name);
+    if (m && vk_strict() && strcmp(name, "vkDestroyDevice") && strcmp(name, "vkCreateSwapchainKHR") &&
+        strcmp(name, "vkDestroySwapchainKHR") && strcmp(name, "vkGetSwapchainImagesKHR") &&
+        strcmp(name, "vkAcquireNextImageKHR") && strcmp(name, "vkQueuePresentKHR")) return NULL;
     if (m) return m;
     if (!g_avail || !real_gdpa) return NULL;
     PFN_vkVoidFunction fn = real_gdpa(dev, name);
-    if (!fn) { klvk_note_missing(name); return (PFN_vkVoidFunction)klvk_missing_trap; }
+    if (!fn && !vk_strict()) { klvk_note_missing(name); return (PFN_vkVoidFunction)klvk_missing_trap; }
     return fn;
 }
 
