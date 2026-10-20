@@ -67,7 +67,17 @@ int main(int argc,char **argv) {
         existing.extendedDynamicState3ColorWriteMask=VK_TRUE;
         assert(create(pd,&dc,0,&device)==VK_ERROR_FEATURE_NOT_PRESENT);
         assert(existing.extendedDynamicState3ColorWriteMask==VK_TRUE);
-        puts("PASS: existing feature chains preserved; unsupported color-write-mask requests still fail");
+        existing.extendedDynamicState3ColorWriteMask=VK_FALSE;
+        VkPhysicalDeviceExtendedDynamicStateFeaturesEXT state1={
+            .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT,.pNext=&existing};
+        dc.pNext=&state1;
+        assert(create(pd,&dc,0,&device)==VK_ERROR_FEATURE_NOT_PRESENT);
+        assert(!state1.extendedDynamicState && state1.pNext==&existing);
+        state1.extendedDynamicState=VK_TRUE;
+        assert(create(pd,&dc,0,&device)==VK_SUCCESS);
+        assert(state1.extendedDynamicState && state1.pNext==&existing && existing.pNext==NULL);
+        ((PFN_vkDestroyDevice)gdpa(device,"vkDestroyDevice"))(device,0);
+        puts("PASS: existing EDS1/EDS3 feature chains preserved; unsupported color-write-mask requests still fail");
     }
     ((PFN_vkDestroyInstance)gipa(instance,"vkDestroyInstance"))(instance,0);
     return 0;
