@@ -121,7 +121,7 @@ void *kl_vulkan_xr_image_mtl(unsigned long long img) { (void)img; return NULL; }
 
 // Opt-in: preserve graphics semantics; only synthetic desktop WSI and
 // Vulkan portability requirements are adapted at this boundary. The separate
-// KL_VK_SAMPLE_LOCATIONS_COMPAT opt-in can enable supported driver features
+// KL_VK_SAMPLE_LOCATIONS_COMPAT and KL_VK_TIMELINE_COMPAT profiles enable supported features
 // for native Alyx; it never removes requested features or installs graphics stubs.
 static int strict_enabled;
 static pthread_once_t strict_once = PTHREAD_ONCE_INIT;
@@ -550,12 +550,13 @@ static int synthetic_wsi(const char *name) {
 }
 
 // Preserve every requested name (including unknown names) and every caller
-// feature/pNext/layer/API field. Only remove implemented WSI names and append
+// feature/pNext/layer/API field, apart from explicit compatibility profiles.
+// Remove implemented WSI names and append
 // an advertised, required portability extension. No fixed 64-name truncation.
 static const char **strict_extensions(uint32_t n, const char *const *names,
                                       int instance, uint32_t *used, int *portability) {
     *used = 0; *portability = 0;
-    const char **result = calloc((size_t)n + 4, sizeof *result);
+    const char **result = calloc((size_t)n + 5, sizeof *result);
     if (!result) return NULL;
     for (uint32_t i = 0; i < n; ++i)
         if (!instance || !synthetic_wsi(names[i])) result[(*used)++] = names[i];
@@ -947,6 +948,50 @@ static VkResult alyx_dynamic_state_compat(VkPhysicalDevice phys, VkDeviceCreateI
     return VK_SUCCESS;
 }
 
+// Opt-in native OpenVR handoff profile. Legacy XR_KHR_vulkan_enable cannot
+// communicate device features to Monado. The launcher selects this together
+// with its explicit timeline acknowledgement and xrizer's temporary-device
+// feature. Never override an existing false feature or mutate caller memory.
+static VkResult alyx_timeline_compat(VkPhysicalDevice phys, VkDeviceCreateInfo *copy,
+                                     const VkExtensionProperties *props, uint32_t count,
+                                     const char **names, uint32_t *n,
+                                     VkPhysicalDeviceTimelineSemaphoreFeatures *extra) {
+    if (!kl_env_on("KL_VK_TIMELINE_COMPAT", 0)) return VK_SUCCESS;
+    if (!ext_supported(props, count, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME))
+        return VK_ERROR_EXTENSION_NOT_PRESENT;
+    PFN_vkGetPhysicalDeviceFeatures2 query = (void *)real_gipa(g_instance, "vkGetPhysicalDeviceFeatures2");
+    if (!query) query = (void *)real_gipa(g_instance, "vkGetPhysicalDeviceFeatures2KHR");
+    if (!query) return VK_ERROR_INITIALIZATION_FAILED;
+    VkPhysicalDeviceTimelineSemaphoreFeatures supported = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES };
+    VkPhysicalDeviceFeatures2 features = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &supported };
+    query(phys, &features);
+    if (!supported.timelineSemaphore) return VK_ERROR_FEATURE_NOT_PRESENT;
+    int existing = 0;
+    for (const VkBaseInStructure *p = copy->pNext; p; p = p->pNext) {
+        if (p->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES) {
+            if (existing++ || !((const VkPhysicalDeviceTimelineSemaphoreFeatures *)p)->timelineSemaphore)
+                return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
+        if (p->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES) {
+            if (existing++ || !((const VkPhysicalDeviceVulkan12Features *)p)->timelineSemaphore)
+                return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
+    }
+    int extension = 0;
+    for (uint32_t i = 0; i < *n; i++)
+        extension |= !strcmp(names[i], VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+    if (!extension) names[(*n)++] = VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME;
+    if (!existing) {
+        *extra = (VkPhysicalDeviceTimelineSemaphoreFeatures) {
+            .sType = supported.sType, .pNext = (void *)copy->pNext, .timelineSemaphore = VK_TRUE };
+        copy->pNext = extra;
+    }
+    VKI("Alyx timeline compatibility: supported timelineSemaphore enabled; caller features preserved\n");
+    return VK_SUCCESS;
+}
+
 static VkResult strict_device(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
                               const VkAllocationCallbacks *alloc, VkDevice *out) {
     PFN_vkCreateDevice create = (PFN_vkCreateDevice)real_gipa(g_instance, "vkCreateDevice");
@@ -966,6 +1011,8 @@ static VkResult strict_device(VkPhysicalDevice phys, const VkDeviceCreateInfo *c
     VkPhysicalDeviceExtendedDynamicStateFeaturesEXT extra1;
     VkPhysicalDeviceExtendedDynamicState3FeaturesEXT extra;
     if (r == VK_SUCCESS) r = alyx_dynamic_state_compat(phys, &copy, props, count, names, &n, &extra1, &extra);
+    VkPhysicalDeviceTimelineSemaphoreFeatures timeline;
+    if (r == VK_SUCCESS) r = alyx_timeline_compat(phys, &copy, props, count, names, &n, &timeline);
     copy.enabledExtensionCount = n; copy.ppEnabledExtensionNames = names;
     trace_extensions("strict-device-request", ci->enabledExtensionCount, ci->ppEnabledExtensionNames);
     trace_chain("strict-device-request", ci->pNext);
