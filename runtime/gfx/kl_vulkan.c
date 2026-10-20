@@ -122,7 +122,9 @@ int   kl_vulkan_fove_indirect_selftest(void) { return -1; }
 #define KLVK_MAX_IMAGES 8
 
 // Opt-in: preserve graphics semantics; only synthetic desktop WSI and
-// Vulkan portability requirements are adapted at this boundary.
+// Vulkan portability requirements are adapted at this boundary. The separate
+// KL_VK_SAMPLE_LOCATIONS_COMPAT opt-in can enable one supported driver feature
+// for native Alyx; it never removes requested features or installs graphics stubs.
 static int strict_enabled;
 static pthread_once_t strict_once = PTHREAD_ONCE_INIT;
 static void strict_configure(void) { strict_enabled = kl_env_on("KL_VK_STRICT", 0); }
@@ -573,7 +575,7 @@ static int synthetic_wsi(const char *name) {
 static const char **strict_extensions(uint32_t n, const char *const *names,
                                       int instance, uint32_t *used, int *portability) {
     *used = 0; *portability = 0;
-    const char **result = calloc((size_t)n + 1, sizeof *result);
+    const char **result = calloc((size_t)n + 2, sizeof *result);
     if (!result) return NULL;
     for (uint32_t i = 0; i < n; ++i)
         if (!instance || !synthetic_wsi(names[i])) result[(*used)++] = names[i];
@@ -902,6 +904,51 @@ static void trace_device_request(const VkDeviceCreateInfo *ci) {
     }
 }
 
+// Explicit native-Alyx compatibility profile. Its state3-disable option still
+// emits vkCmdSetSampleLocationsEnableEXT. Enable the real supported feature so
+// that command resolves and executes in the driver. Never remove a request,
+// claim color-write-mask support, duplicate a feature struct or install a stub.
+static VkResult sample_locations_compat(VkPhysicalDevice phys, VkDeviceCreateInfo *copy,
+                                        const VkExtensionProperties *props, uint32_t count,
+                                        const char **names, uint32_t *n,
+                                        VkPhysicalDeviceExtendedDynamicState3FeaturesEXT *extra) {
+    if (!kl_env_on("KL_VK_SAMPLE_LOCATIONS_COMPAT", 0)) return VK_SUCCESS;
+    int sample_locations = 0, state3 = 0;
+    for (uint32_t i = 0; i < *n; i++) {
+        sample_locations |= !strcmp(names[i], "VK_EXT_sample_locations");
+        state3 |= !strcmp(names[i], "VK_EXT_extended_dynamic_state3");
+    }
+    if (!sample_locations) return VK_SUCCESS;
+    if (!ext_supported(props, count, "VK_EXT_extended_dynamic_state3"))
+        return VK_ERROR_EXTENSION_NOT_PRESENT;
+    PFN_vkGetPhysicalDeviceFeatures2 query = (PFN_vkGetPhysicalDeviceFeatures2)
+        real_gipa(g_instance, "vkGetPhysicalDeviceFeatures2");
+    if (!query) query = (PFN_vkGetPhysicalDeviceFeatures2)
+        real_gipa(g_instance, "vkGetPhysicalDeviceFeatures2KHR");
+    if (!query) return VK_ERROR_INITIALIZATION_FAILED;
+    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT supported = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT };
+    VkPhysicalDeviceFeatures2 features = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &supported };
+    query(phys, &features);
+    if (!supported.extendedDynamicState3SampleLocationsEnable)
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    const VkPhysicalDeviceExtendedDynamicState3FeaturesEXT *existing = NULL;
+    for (const VkBaseInStructure *p = copy->pNext; p; p = p->pNext)
+        if (p->sType == supported.sType) existing = (const void *)p;
+    if (existing && !existing->extendedDynamicState3SampleLocationsEnable)
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    if (!state3) names[(*n)++] = "VK_EXT_extended_dynamic_state3";
+    if (!existing) {
+        *extra = (VkPhysicalDeviceExtendedDynamicState3FeaturesEXT) {
+            .sType = supported.sType, .pNext = (void *)copy->pNext,
+            .extendedDynamicState3SampleLocationsEnable = VK_TRUE };
+        copy->pNext = extra;
+    }
+    VKI("Alyx compatibility: enabled real extendedDynamicState3SampleLocationsEnable; caller features preserved\n");
+    return VK_SUCCESS;
+}
+
 static VkResult strict_device(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
                               const VkAllocationCallbacks *alloc, VkDevice *out) {
     PFN_vkCreateDevice create = (PFN_vkCreateDevice)real_gipa(g_instance, "vkCreateDevice");
@@ -918,16 +965,19 @@ static VkResult strict_device(VkPhysicalDevice phys, const VkDeviceCreateInfo *c
     if (r == VK_SUCCESS && !portability && ext_supported(props, count, "VK_KHR_portability_subset"))
         names[n++] = "VK_KHR_portability_subset";
     VkDeviceCreateInfo copy = *ci;
+    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT extra;
+    if (r == VK_SUCCESS) r = sample_locations_compat(phys, &copy, props, count, names, &n, &extra);
     copy.enabledExtensionCount = n; copy.ppEnabledExtensionNames = names;
     trace_extensions("strict-device-request", ci->enabledExtensionCount, ci->ppEnabledExtensionNames);
     trace_chain("strict-device-request", ci->pNext);
     trace_device_request(ci);
     trace_extensions("strict-device-forwarded", n, names);
+    trace_chain("strict-device-forwarded", copy.pNext);
     if (r == VK_SUCCESS) {
         r = create(phys, &copy, alloc, out);
         VKI("strict vkCreateDevice driver result=%d\n", (int)r);
     } else {
-        VKI("strict vkCreateDevice extension enumeration result=%d\n", (int)r);
+        VKI("strict vkCreateDevice preflight result=%d\n", (int)r);
     }
     free(props); free(names);
     // In particular: no FEATURE_NOT_PRESENT clamp/retry or mutation of caller pNext.
