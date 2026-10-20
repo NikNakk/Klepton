@@ -25,6 +25,7 @@
 #include "klepton.h"
 #include "kl_x18.h"
 #include "kl_guestpatch.h"
+#include "kl_svc.h"
 
 
 // ---------- ELF64 subset ----------
@@ -356,7 +357,13 @@ static void rewrite_tls(uint8_t *p, size_t n, uint64_t va, const char *path,
                         kl_stats *st) {
     uint32_t *w = (uint32_t *)p;
     size_t words = n / 4;
+    const char *svc_policy = getenv("KL_SVC_POLICY");
+    int trap_svc = svc_policy && !strcmp(svc_policy, "trap-code");
     for (size_t i = 0; i < words; i++) {
+        if (trap_svc && kl_svc_to_trap(&w[i])) {
+            st->svc_sites++; st->svc_trapped++;
+            continue;
+        }
         if (w[i] == 0xd4000001u && kl_svc_is_bare(w, i)) {
             static int said;
             if (!said++) fprintf(stderr, "  [klepton] %s: bare svc #0 (no syscall number) at +0x%llx and "
@@ -1057,7 +1064,9 @@ static int protect_pages(kl_image *img, const Elf64_Ehdr *eh, const Elf64_Phdr *
 static int reject_raw_svc(const uint8_t *file, size_t size, const Elf64_Ehdr *eh) {
     const char *policy = getenv("KL_SVC_POLICY");
     if (!policy || !strcmp(policy, "legacy")) return 0;
-    if (strcmp(policy, "reject")) { err("unknown KL_SVC_POLICY (use legacy or reject)"); return -1; }
+    int trap = !strcmp(policy, "trap-code");
+    int code_only = !strcmp(policy, "reject-code") || trap;
+    if (strcmp(policy, "reject") && !code_only) { err("unknown KL_SVC_POLICY (use legacy, reject, reject-code or trap-code)"); return -1; }
     if (eh->e_phentsize != sizeof(Elf64_Phdr) || eh->e_phoff > size ||
         eh->e_phnum > (size - eh->e_phoff) / sizeof(Elf64_Phdr)) {
         err("SVC preflight: invalid program headers"); return -1;
@@ -1068,12 +1077,41 @@ static int reject_raw_svc(const uint8_t *file, size_t size, const Elf64_Ehdr *eh
         if (ph[i].p_offset > size || ph[i].p_filesz > size - ph[i].p_offset) {
             err("SVC preflight: invalid executable segment"); return -1;
         }
+        if (code_only) continue;
         for (uint64_t off = (4 - (ph[i].p_vaddr & 3)) & 3; off + 4 <= ph[i].p_filesz; off += 4) {
             uint32_t word; memcpy(&word, file + ph[i].p_offset + off, sizeof word);
             if ((word & 0xffe0001fu) == 0xd4000001u) {
                 err("raw SVC instruction candidate at VA %#llx refused by KL_SVC_POLICY=reject (before guest mapping)",
                     (unsigned long long)(ph[i].p_vaddr + off));
                 return -1;
+            }
+        }
+    }
+    if (code_only) {
+        if (!eh->e_shnum || eh->e_shentsize != sizeof(Elf64_Shdr) || eh->e_shoff > size ||
+            eh->e_shnum > (size - eh->e_shoff) / sizeof(Elf64_Shdr)) {
+            err("SVC preflight: reject-code requires valid section headers"); return -1;
+        }
+        const Elf64_Shdr *sh = (const Elf64_Shdr *)(file + eh->e_shoff);
+        for (unsigned i = 0; i < eh->e_shnum; ++i) {
+            if (!(sh[i].sh_flags & SHF_EXECINSTR)) continue;
+            if (sh[i].sh_type != SHT_PROGBITS || sh[i].sh_offset > size || sh[i].sh_size > size - sh[i].sh_offset) {
+                err("SVC preflight: invalid executable section"); return -1;
+            }
+            int mapped = 0;
+            for (unsigned j = 0; j < eh->e_phnum; ++j) {
+                if (ph[j].p_type != PT_LOAD || !(ph[j].p_flags & PF_X) || sh[i].sh_offset < ph[j].p_offset) continue;
+                uint64_t delta = sh[i].sh_offset - ph[j].p_offset;
+                if (delta <= ph[j].p_filesz && sh[i].sh_size <= ph[j].p_filesz - delta &&
+                    sh[i].sh_addr >= ph[j].p_vaddr && sh[i].sh_addr - ph[j].p_vaddr == delta) mapped = 1;
+            }
+            if (!mapped) { err("SVC preflight: executable section not mapped consistently"); return -1; }
+            for (uint64_t off = (4 - (sh[i].sh_addr & 3)) & 3; off + 4 <= sh[i].sh_size; off += 4) {
+                uint32_t word; memcpy(&word, file + sh[i].sh_offset + off, sizeof word);
+                if (!trap && (word & 0xffe0001fu) == 0xd4000001u) {
+                    err("raw SVC instruction candidate at VA %#llx refused by KL_SVC_POLICY=reject-code (before guest mapping)",
+                        (unsigned long long)(sh[i].sh_addr + off)); return -1;
+                }
             }
         }
     }

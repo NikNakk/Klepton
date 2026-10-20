@@ -70,6 +70,7 @@ typedef struct {
     // kernel clobbers. Nonzero
     // here is a finding, not a statistic — rewrite_tls names each one.
     unsigned tls_refused;
+    unsigned svc_trapped;                            // replaced with fatal BRK, never success/NOP
     unsigned svc_sites;                              // inline syscalls found
     unsigned imports_bound, imports_missing;
     // ...and the undefined imports that are WEAK, which is a different answer
