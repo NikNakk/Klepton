@@ -19,6 +19,6 @@ assert 'device-request core word=4 value=1' in s  # geometryShader
 assert 'VkPhysicalDeviceFragmentDensityMapFeaturesEXT payloadWord=0 value=1' in s
 assert 'VkPhysicalDeviceFragmentDensityMapFeaturesEXT payloadWord=1 value=1' in s
 assert 'strict vkCreateDevice driver result=-8' in s
-assert 'strict vkCreateDevice extension enumeration result=-3' in s
+assert 'strict vkCreateDevice preflight result=-3' in s
 print('PASS: exact feature payload and driver/enumeration failure diagnostics')
 CHECK
