@@ -2113,6 +2113,8 @@ static const kl_entry g_shim[] = {
     E("__libc_current_sigrtmin", klb___libc_current_sigrtmin),
     E("__libc_current_sigrtmax", klb___libc_current_sigrtmax),
     E("sincosf", klb_sincosf), E("sincos", klb_sincos),
+    // Linux/Darwin AArch64 share the double -> double C ABI.
+    E("floor", floor),
     E("putchar", klb_putchar), E("getchar", klb_getchar),
     E("fdatasync", klb_fdatasync),
     E("__cmsg_nxthdr", klb___cmsg_nxthdr),
