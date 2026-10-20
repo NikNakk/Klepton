@@ -859,6 +859,49 @@ static VkResult record_device(VkPhysicalDevice phys, const VkDeviceCreateInfo *c
     VKI("vkCreateDevice tracked, queue family %u\n", d->queue_family);
     return VK_SUCCESS;
 }
+// Capture device requests without changing feature negotiation. Payload words
+// exclude sType/pNext; trailing structure padding is explicitly not a feature.
+// Together with the Vulkan registry these identify exact requested fields.
+static void trace_device_request(const VkDeviceCreateInfo *ci) {
+    if (!fdm_trace()) return;
+    VKI("device-request flags=%u queues=%u layers=%u coreFeatures=%s\n",
+        ci->flags, ci->queueCreateInfoCount, ci->enabledLayerCount,
+        ci->pEnabledFeatures ? "present" : "absent");
+    if (ci->pEnabledFeatures) {
+        const VkBool32 *words = (const void *)ci->pEnabledFeatures;
+        for (size_t i = 0; i < sizeof(*ci->pEnabledFeatures) / sizeof(*words); i++)
+            VKI("device-request core word=%zu value=%u\n", i, words[i]);
+    }
+    for (uint32_t i = 0; i < ci->queueCreateInfoCount; i++) {
+        const VkDeviceQueueCreateInfo *q = &ci->pQueueCreateInfos[i];
+        VKI("device-request queue=%u family=%u count=%u flags=%u\n",
+            i, q->queueFamilyIndex, q->queueCount, q->flags);
+        for (uint32_t j = 0; j < q->queueCount; j++)
+            VKI("device-request queue=%u priority=%u value=%a\n", i, j,
+                (double)q->pQueuePriorities[j]);
+        trace_chain("device-queue-request", q->pNext);
+    }
+    for (const VkBaseInStructure *p = ci->pNext; p; p = p->pNext) {
+        if (p->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
+            const VkPhysicalDeviceFeatures2 *f = (const void *)p;
+            const VkBool32 *words = (const void *)&f->features;
+            for (size_t i = 0; i < sizeof(f->features) / sizeof(*words); i++)
+                VKI("device-request features2-core word=%zu value=%u\n", i, words[i]);
+        }
+        for (size_t k = 0; k < sizeof(klvk_feature_structs) / sizeof(klvk_feature_structs[0]); k++) {
+            if (klvk_feature_structs[k].st != p->sType) continue;
+            const size_t offset = sizeof(VkBaseInStructure);
+            const unsigned char *bytes = (const void *)p;
+            for (size_t i = offset; i + sizeof(uint32_t) <= klvk_feature_structs[k].size; i += sizeof(uint32_t)) {
+                uint32_t value; memcpy(&value, bytes + i, sizeof(value));
+                VKI("device-request %s payloadWord=%zu value=%u (may include tail padding)\n",
+                    klvk_feature_structs[k].name, (i - offset) / sizeof(uint32_t), value);
+            }
+            break;
+        }
+    }
+}
+
 static VkResult strict_device(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
                               const VkAllocationCallbacks *alloc, VkDevice *out) {
     PFN_vkCreateDevice create = (PFN_vkCreateDevice)real_gipa(g_instance, "vkCreateDevice");
@@ -878,8 +921,14 @@ static VkResult strict_device(VkPhysicalDevice phys, const VkDeviceCreateInfo *c
     copy.enabledExtensionCount = n; copy.ppEnabledExtensionNames = names;
     trace_extensions("strict-device-request", ci->enabledExtensionCount, ci->ppEnabledExtensionNames);
     trace_chain("strict-device-request", ci->pNext);
+    trace_device_request(ci);
     trace_extensions("strict-device-forwarded", n, names);
-    if (r == VK_SUCCESS) r = create(phys, &copy, alloc, out);
+    if (r == VK_SUCCESS) {
+        r = create(phys, &copy, alloc, out);
+        VKI("strict vkCreateDevice driver result=%d\n", (int)r);
+    } else {
+        VKI("strict vkCreateDevice extension enumeration result=%d\n", (int)r);
+    }
     free(props); free(names);
     // In particular: no FEATURE_NOT_PRESENT clamp/retry or mutation of caller pNext.
     return r == VK_SUCCESS ? record_device(phys, ci, alloc, out) : r;
