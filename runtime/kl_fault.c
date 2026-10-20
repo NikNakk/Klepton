@@ -15,6 +15,7 @@
 #include <mach/mach.h>
 #include "klepton.h"
 #include "kl_fault.h"
+#include "kl_svc.h"
 #include "kl_egl.h"
 #include "kl_opensl.h"
 #include "kl_ovrp.h"
@@ -200,6 +201,15 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
     }
 
     char buf[256];
+    if (sig == SIGTRAP && uc && kl_addr_image(pc, NULL) &&
+        *(const uint32_t *)pc == KL_SVC_TRAP_WORD) {
+        int note = snprintf(buf, sizeof buf,
+            "[klepton] UNSUPPORTED RAW SVC: stopped at %s+0x%zx; Linux x8=%llu Darwin x16=%llu; no syscall executed\n",
+            img ? img : "?", off,
+            (unsigned long long)uc->uc_mcontext->__ss.__x[8],
+            (unsigned long long)uc->uc_mcontext->__ss.__x[16]);
+        if (note > 0) klf_emit(buf, (size_t)note < sizeof buf ? (size_t)note : sizeof buf - 1);
+    }
     int  n = snprintf(buf, sizeof buf,
                       "\n[klepton] fault: signal %d at %p, pc %s+0x%zx (%p), thread %llu%s\n",
                       sig, si ? si->si_addr : NULL, img ? img : "<host>", off, pc,
