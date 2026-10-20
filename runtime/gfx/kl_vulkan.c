@@ -555,7 +555,7 @@ static int synthetic_wsi(const char *name) {
 static const char **strict_extensions(uint32_t n, const char *const *names,
                                       int instance, uint32_t *used, int *portability) {
     *used = 0; *portability = 0;
-    const char **result = calloc((size_t)n + 2, sizeof *result);
+    const char **result = calloc((size_t)n + 3, sizeof *result);
     if (!result) return NULL;
     for (uint32_t i = 0; i < n; ++i)
         if (!instance || !synthetic_wsi(names[i])) result[(*used)++] = names[i];
@@ -885,7 +885,9 @@ static void trace_device_request(const VkDeviceCreateInfo *ci) {
 
 // Explicit native-Alyx compatibility profile. Its state3-disable option still
 // emits vkCmdSetSampleLocationsEnableEXT. Enable the real supported feature so
-// that command resolves and executes in the driver. Never remove a request,
+// that command resolves and executes in the driver. Alyx's broad disable switch
+// removes both sample-location extensions, so absence from the request is not
+// a reason to skip this explicit profile. Never remove a request,
 // claim color-write-mask support, duplicate a feature struct or install a stub.
 static VkResult sample_locations_compat(VkPhysicalDevice phys, VkDeviceCreateInfo *copy,
                                         const VkExtensionProperties *props, uint32_t count,
@@ -897,8 +899,8 @@ static VkResult sample_locations_compat(VkPhysicalDevice phys, VkDeviceCreateInf
         sample_locations |= !strcmp(names[i], "VK_EXT_sample_locations");
         state3 |= !strcmp(names[i], "VK_EXT_extended_dynamic_state3");
     }
-    if (!sample_locations) return VK_SUCCESS;
-    if (!ext_supported(props, count, "VK_EXT_extended_dynamic_state3"))
+    if (!ext_supported(props, count, "VK_EXT_sample_locations") ||
+        !ext_supported(props, count, "VK_EXT_extended_dynamic_state3"))
         return VK_ERROR_EXTENSION_NOT_PRESENT;
     PFN_vkGetPhysicalDeviceFeatures2 query = (PFN_vkGetPhysicalDeviceFeatures2)
         real_gipa(g_instance, "vkGetPhysicalDeviceFeatures2");
@@ -917,6 +919,7 @@ static VkResult sample_locations_compat(VkPhysicalDevice phys, VkDeviceCreateInf
         if (p->sType == supported.sType) existing = (const void *)p;
     if (existing && !existing->extendedDynamicState3SampleLocationsEnable)
         return VK_ERROR_FEATURE_NOT_PRESENT;
+    if (!sample_locations) names[(*n)++] = "VK_EXT_sample_locations";
     if (!state3) names[(*n)++] = "VK_EXT_extended_dynamic_state3";
     if (!existing) {
         *extra = (VkPhysicalDeviceExtendedDynamicState3FeaturesEXT) {
@@ -924,7 +927,7 @@ static VkResult sample_locations_compat(VkPhysicalDevice phys, VkDeviceCreateInf
             .extendedDynamicState3SampleLocationsEnable = VK_TRUE };
         copy->pNext = extra;
     }
-    VKI("Alyx compatibility: enabled real extendedDynamicState3SampleLocationsEnable; caller features preserved\n");
+    VKI("Alyx compatibility: enabled real sample-locations extension and extendedDynamicState3SampleLocationsEnable; caller features preserved\n");
     return VK_SUCCESS;
 }
 

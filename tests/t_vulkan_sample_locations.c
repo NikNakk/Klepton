@@ -26,7 +26,7 @@ int main(int argc,char **argv) {
         .queueCount=1,.pQueuePriorities=&priority};
     const char *extension="VK_EXT_sample_locations";
     VkDeviceCreateInfo dc={.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.queueCreateInfoCount=1,
-        .pQueueCreateInfos=&queue,.enabledExtensionCount=1,.ppEnabledExtensionNames=&extension};
+        .pQueueCreateInfos=&queue,.enabledExtensionCount=0,.ppEnabledExtensionNames=&extension};
     VkDeviceCreateInfo before=dc;VkDevice device;
     PFN_vkCreateDevice create=(void*)gipa(instance,"vkCreateDevice");
     assert(create(pd,&dc,0,&device)==VK_SUCCESS);
