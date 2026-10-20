@@ -48,6 +48,9 @@ void      *kl_sym(kl_image *img, const char *name);
 void       kl_interpose(const char *name, void *fn);
 // Called once per image right after it is registered (before guest code
 // of a later dlopen can run it); the host uses it for byte-checked fixes.
+// With KL_LOAD_DEFER_INIT=1, recursive groups first finish mapping/rebinding,
+// then all new image hooks run before any group constructor. The original
+// requested load path is preserved, including library aliases.
 extern void (*kl_image_loaded_hook)(const char *path, kl_image *img);
 void      *kl_interpose_lookup(const char *name);   // an interposer by name, or NULL
 // Run DT_INIT_ARRAY. Separate from kl_load so tests can inspect first.
