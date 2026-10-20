@@ -22,10 +22,15 @@
 #include "kl_openxr.h"
 
 #define KL_MAX_IMAGES 1024   // VeRantyx: was 64; Alyx loads ~110 images
-typedef struct { char soname[128]; kl_image *img;     char real[1024];       // realpath of the file, so two names for one file are one image
+typedef struct {
+    char soname[128];
+    kl_image *img;
+    char load_path[1024]; // preserve the original path passed to image hooks/JNI
+    char real[1024];      // canonical path, so two names for one file are one image
 } entry;
 static entry  g_imgs[KL_MAX_IMAGES];
 static int    g_nimgs = 0;
+static int    g_loading_n;
 static char   g_libdir[512] = ".";
 static char   g_dlerr[256];
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -97,6 +102,7 @@ void kl_register_image(const char *soname, kl_image *img) {
     if (g_nimgs < KL_MAX_IMAGES) {
         snprintf(g_imgs[g_nimgs].soname, sizeof g_imgs[0].soname, "%s", base);
         if (!realpath(soname, g_imgs[g_nimgs].real)) snprintf(g_imgs[g_nimgs].real, sizeof g_imgs[0].real, "%s", soname);
+        snprintf(g_imgs[g_nimgs].load_path, sizeof g_imgs[0].load_path, "%s", soname);
         g_imgs[g_nimgs].img = img;
         g_nimgs++;
     }
@@ -110,7 +116,8 @@ void kl_register_image(const char *soname, kl_image *img) {
     // here — not searching for any GL library, which klepton.h warns breaks Steam
     // Link/VRChat/RE4 — routes them to gl4es for every driver.
     if (!strcmp(base, "libgl4es.so")) kl_shim_set_guest_gl(img);
-    if (kl_image_loaded_hook) kl_image_loaded_hook(soname, img);
+    if (kl_image_loaded_hook && !(g_loading_n && kl_env_on("KL_LOAD_DEFER_INIT", 0)))
+        kl_image_loaded_hook(soname, img);
 }
 
 kl_image *kl_find_image(const char *soname) {
@@ -379,11 +386,11 @@ static void kl_maybe_jni_onload(const char *path, kl_image *img) {
 // missing imports are tried again.
 static kl_image *kl_load_recursive_inner(const char *path);
 static char g_loading_names[64][128];
-static int g_loading_n;
 static int g_loading_sentinel_storage;
 static int loading_has(const char *b) { for (int i = 0; i < g_loading_n; i++) if (!strcmp(g_loading_names[i], b)) return 1; return 0; }
 
 kl_image *kl_load_recursive(const char *path) {
+    int first_image = g_nimgs;
     kl_image *have = kl_find_image(path);
     if (have) return have;                       // already loaded
     const char *bname = strrchr(path, '/'); bname = bname ? bname + 1 : path;
@@ -399,6 +406,19 @@ kl_image *kl_load_recursive(const char *path) {
         int n = g_nimgs;
         pthread_mutex_unlock(&g_lock);
         for (int i = 0; i < n; i++) kl_rebind_missing(g_imgs[i].img);
+        // Opt-in two-phase initialization: a cycle can leave imports unresolved
+        // until every member is mapped. Validate the entire new group after
+        // rebinding and before executing any constructor. Constructor dlopen
+        // starts its own group; the snapshot excludes those nested additions.
+        if (result && kl_env_on("KL_LOAD_DEFER_INIT", 0)) {
+            for (int i = first_image; i < n; i++)
+                if (kl_image_loaded_hook) kl_image_loaded_hook(g_imgs[i].load_path, g_imgs[i].img);
+            if (!kl_env_on("KL_LOAD_NO_INIT", 0))
+                for (int i = first_image; i < n; i++) {
+                    kl_run_init(g_imgs[i].img);
+                    kl_maybe_jni_onload(g_imgs[i].load_path, g_imgs[i].img);
+                }
+        }
     }
     return result;
 }
@@ -471,7 +491,7 @@ static kl_image *kl_load_recursive_inner(const char *path) {
     kl_register_image(path, img);
     if (kl_env_on("KL_LOAD_NO_INIT", 0)) {
         fprintf(stderr, "  [dl] diagnostic KL_LOAD_NO_INIT: no constructors/JNI for %s\n", path);
-    } else {
+    } else if (!kl_env_on("KL_LOAD_DEFER_INIT", 0)) {
         kl_run_init(img);
         kl_maybe_jni_onload(path, img);
     }
