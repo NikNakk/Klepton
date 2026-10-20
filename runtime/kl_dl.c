@@ -469,8 +469,12 @@ static kl_image *kl_load_recursive_inner(const char *path) {
     kl_image *img = kl_load_auto(path);
     if (!img) return NULL;
     kl_register_image(path, img);
-    kl_run_init(img);
-    kl_maybe_jni_onload(path, img);
+    if (kl_env_on("KL_LOAD_NO_INIT", 0)) {
+        fprintf(stderr, "  [dl] diagnostic KL_LOAD_NO_INIT: no constructors/JNI for %s\n", path);
+    } else {
+        kl_run_init(img);
+        kl_maybe_jni_onload(path, img);
+    }
     return img;
 }
 
