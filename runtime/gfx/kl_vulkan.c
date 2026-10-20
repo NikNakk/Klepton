@@ -139,10 +139,11 @@ static int vk_trace(void) {
 // Observational tracing at the guest boundary, before compatibility filtering.
 // No feature/extension is added and no caller memory is modified by this trace.
 static int fdm_trace(void) { return kl_env_on("KL_VK_FOVEATION_TRACE", 0); }
-static void trace_chain(const char *where, const void *chain) {
+static void trace_chain_impl(const char *where, const void *chain, int payload) {
     if (!fdm_trace()) return;
     for (const VkBaseInStructure *p = chain; p; p = p->pNext) {
         VKI("fdm %s pNext sType=%u\n", where, (unsigned)p->sType);
+        if (!payload) continue;
         switch (p->sType) {
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT: {
             const VkPhysicalDeviceFragmentDensityMapFeaturesEXT *f = (const void *)p;
@@ -172,9 +173,38 @@ static void trace_chain(const char *where, const void *chain) {
                 (unsigned long long)f->imageView, f->imageLayout);
             break;
         }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_OFFSET_FEATURES_EXT:
+            VKI("fdm %s offset-feature EXT/QCOM-alias=%u\n", where,
+                ((const VkPhysicalDeviceFragmentDensityMapOffsetFeaturesEXT *)p)->fragmentDensityMapOffset);
+            break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_OFFSET_PROPERTIES_EXT: {
+            const VkPhysicalDeviceFragmentDensityMapOffsetPropertiesEXT *f = (const void *)p;
+            VKI("fdm %s offset-granularity=%ux%u EXT/QCOM-alias\n", where,
+                f->fragmentDensityOffsetGranularity.width, f->fragmentDensityOffsetGranularity.height);
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_PROPERTIES_EXT: {
+            const VkPhysicalDeviceFragmentDensityMapPropertiesEXT *f = (const void *)p;
+            VKI("fdm %s texel-min=%ux%u texel-max=%ux%u invocations=%u\n", where,
+                f->minFragmentDensityTexelSize.width, f->minFragmentDensityTexelSize.height,
+                f->maxFragmentDensityTexelSize.width, f->maxFragmentDensityTexelSize.height, f->fragmentDensityInvocations);
+            break;
+        }
+        case VK_STRUCTURE_TYPE_RENDER_PASS_FRAGMENT_DENSITY_MAP_OFFSET_END_INFO_EXT: {
+            const VkRenderPassFragmentDensityMapOffsetEndInfoEXT *f = (const void *)p;
+            VKI("fdm %s offset-count=%u EXT/QCOM-alias\n", where, f->fragmentDensityOffsetCount);
+            // Two eyes are expected; bound malformed/large diagnostic payloads.
+            for (uint32_t i = 0; f->pFragmentDensityOffsets && i < f->fragmentDensityOffsetCount && i < 8; i++)
+                VKI("fdm %s offset-eye=%u x=%d y=%d\n", where, i,
+                    f->pFragmentDensityOffsets[i].x, f->pFragmentDensityOffsets[i].y);
+            break;
+        }
         default: break;
         }
     }
+}
+static void trace_chain(const char *where, const void *chain) {
+    trace_chain_impl(where, chain, 1);
 }
 static void trace_extensions(const char *where, uint32_t count, const char *const *names) {
     if (!fdm_trace()) return;
@@ -586,6 +616,7 @@ static VkResult strict_instance(const VkInstanceCreateInfo *ci,
     copy.enabledExtensionCount = n; copy.ppEnabledExtensionNames = names;
     if (portability) copy.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
     trace_extensions("strict-instance-forwarded", n, names);
+    if (fdm_trace()) VKI("fdm-observe schema=1 strict-passthrough\n");
     PFN_vkCreateInstance create = (PFN_vkCreateInstance)real_gipa(NULL, "vkCreateInstance");
     if (r == VK_SUCCESS) r = create ? create(&copy, alloc, out) : VK_ERROR_INITIALIZATION_FAILED;
     if (r == VK_SUCCESS) g_instance = *out;
@@ -4362,7 +4393,7 @@ static void VKAPI_CALL klvk_GetPhysicalDeviceFeatures2(
         if (!real) real = (PFN_vkGetPhysicalDeviceFeatures2)
             real_gipa(g_instance, "vkGetPhysicalDeviceFeatures2KHR"); } }
     pd = KLVK_PHYS_OR_SUB(pd, "GetPhysicalDeviceFeatures2");
-    trace_chain("Features2-request", f->pNext);
+    trace_chain_impl("Features2-request", f->pNext, 0);
     if (real) real(pd, f);
     trace_chain("Features2-result", f->pNext);
 }
@@ -6540,6 +6571,8 @@ static void klvk_note_missing(const char *name) {
         "kills as an invalid page)\n", name);
 }
 
+#include "kl_vulkan_observe.h"
+
 static PFN_vkVoidFunction VKAPI_CALL klvk_GetInstanceProcAddr(VkInstance inst,
                                                               const char *name) {
     if (fdm_trace() && name) VKI("fdm resolve=%s\n", name);
@@ -6558,7 +6591,7 @@ static PFN_vkVoidFunction VKAPI_CALL klvk_GetInstanceProcAddr(VkInstance inst,
     if (!g_avail) return NULL;
     PFN_vkVoidFunction fn = real_gipa(vk_strict() ? inst : (inst ? inst : g_instance), name);
     if (!fn && !vk_strict()) { klvk_note_missing(name); return (PFN_vkVoidFunction)klvk_missing_trap; }
-    return fn;
+    return strict_observe_proc(name, fn);
 }
 
 static PFN_vkVoidFunction VKAPI_CALL klvk_GetDeviceProcAddr(VkDevice dev,
@@ -6577,7 +6610,7 @@ static PFN_vkVoidFunction VKAPI_CALL klvk_GetDeviceProcAddr(VkDevice dev,
     if (!g_avail || !real_gdpa) return NULL;
     PFN_vkVoidFunction fn = real_gdpa(dev, name);
     if (!fn && !vk_strict()) { klvk_note_missing(name); return (PFN_vkVoidFunction)klvk_missing_trap; }
-    return fn;
+    return strict_observe_proc(name, fn);
 }
 
 // ---------------------------------------------------------------------------
@@ -6616,7 +6649,7 @@ void *kl_vulkan_sym(const char *name) {
     // MoltenVK exports the whole API statically, so a guest that resolves entry
     // points by dlsym rather than through vkGetInstanceProcAddr — which is legal
     // and which libSLZQuestNative does — gets a working pointer either way.
-    return mvk_sym(name);
+    return (void *)strict_observe_proc(name, (PFN_vkVoidFunction)mvk_sym(name));
 }
 
 void *kl_vulkan_lookup(const char *name) {
