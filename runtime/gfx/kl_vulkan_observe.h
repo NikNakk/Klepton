@@ -116,6 +116,7 @@ static void VKAPI_CALL obs_CmdSetFragmentShadingRateKHR(VkCommandBuffer cb, cons
 }
 
 static PFN_vkVoidFunction strict_observe_proc(const char *name, PFN_vkVoidFunction native) {
+    native = strict_resolve_observe_proc(name, native);
     if (!native || !vk_strict() || !fdm_trace() || !kl_env_on("KL_VK_FOVEATION_OBSERVE", 0)) return native;
 #define ENTRY(n) {"vk" #n, (PFN_vkVoidFunction)obs_##n, &obs_native_##n}
     static const struct { const char *name; PFN_vkVoidFunction wrapper; PFN_vkVoidFunction *native; } entries[] = {

@@ -87,3 +87,31 @@ VK_ERROR_FEATURE_NOT_PRESENT for geometryShader and preserves the requested
 true flag. Both query base fragmentDensityMap=false. This does not resolve
 KosmicKrisp's missing Metal-object interoperability with Monado and is not an
 Alyx run or a benchmark.
+
+## Custom resolve diagnosis (21 October 2026)
+
+`KL_VK_CUSTOM_RESOLVE_TRACE=1` independently enables bounded metadata observation
+in the strict path. It records original image/view associations, render-pass
+attachments/subpasses, dynamic rendering attachments, custom pipeline formats,
+input attachment indices and original shader metadata (no shader byte dump).
+Actual `vkCmdBeginCustomResolveEXT` calls, pipeline binds and direct draws on the
+same recording thread are recorded. Direct-draw association is diagnostic only:
+secondary buffers, indirect draws and cross-thread handovers are not replayed.
+Budgets are separate for custom pipelines/rendering and ordinary work, so an
+intro cannot consume every custom event slot. Budget exhaustion is explicit.
+
+No driver feature, pipeline, attachment, shader or command is changed. Native
+errors/partial pipeline outputs pass through; missing commands remain NULL;
+a changed native dispatch target bypasses the observer. Opting out retains the
+native pointer. Trace output contains transient Vulkan handles and stays local.
+The existing FDM observer can be enabled independently or simultaneously.
+
+Run the owned no-GPU forwarding/metadata/budget tests with:
+
+```sh
+sh tools/check_vulkan_resolve.sh
+```
+
+This is a diagnostic capture, not a performance run or a claim that Alyx's
+rendering failure is fixed. The separate application launcher retains the
+working custom-resolve-disabled path as the normal KosmicKrisp candidate.
