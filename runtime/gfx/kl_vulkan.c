@@ -637,6 +637,7 @@ static VkResult strict_instance(const VkInstanceCreateInfo *ci,
     if (portability) copy.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
     trace_extensions("strict-instance-forwarded", n, names);
     if (fdm_trace()) VKI("fdm-observe schema=1 strict-passthrough\n");
+    if (kl_env_on("KL_VK_CUSTOM_RESOLVE_TRACE", 0)) VKI("resolve-observe schema=1 strict-passthrough\n");
     PFN_vkCreateInstance create = (PFN_vkCreateInstance)real_gipa(NULL, "vkCreateInstance");
     if (r == VK_SUCCESS) r = create ? create(&copy, alloc, out) : VK_ERROR_INITIALIZATION_FAILED;
     if (r == VK_SUCCESS) g_instance = *out;
@@ -7600,6 +7601,7 @@ static void klvk_note_missing(const char *name) {
         "kills as an invalid page)\n", name);
 }
 
+#include "kl_vulkan_resolve_observe.h"
 #include "kl_vulkan_observe.h"
 
 static PFN_vkVoidFunction VKAPI_CALL klvk_GetInstanceProcAddr(VkInstance inst,
