@@ -19,6 +19,10 @@ import sys
 from pathlib import Path
 trace=Path(sys.argv[1]).read_text();off=Path(sys.argv[2]).read_text()
 assert 'offset-eye=1 x=-32 y=-8' in trace
+for alias in ('CmdEndRendering2EXT', 'CmdEndRendering2KHR'):
+    assert f'fdm-observe {alias} called' in trace
+    assert f'observe {alias} offset-eye=1 x=-32 y=-8' in trace
+    assert f'fdm-observe {alias} called' not in off
 assert 'offset-granularity=16x8' in trace
 assert 'features map=0 dynamic=0 nonSubsampled=0' in trace
 assert 'shader capability=5291' in trace and 'shader builtin=5292' in trace

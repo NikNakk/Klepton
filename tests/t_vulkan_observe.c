@@ -47,10 +47,17 @@ int main(int argc,char **argv) {
  ((PFN_vkCmdEndRenderPass2)gdpa((VkDevice)1,"vkCmdEndRenderPass2"))((VkCommandBuffer)0x789,&end);
  ((PFN_vkCmdEndRenderPass2)gdpa((VkDevice)1,"vkCmdEndRenderPass2KHR"))((VkCommandBuffer)0x789,&end);
  assert(end.pNext==&endmap && endmap.pFragmentDensityOffsets==offsets && offsets[1].x==-32);
+ VkRenderingEndInfoKHR rend={.sType=VK_STRUCTURE_TYPE_RENDERING_END_INFO_KHR,.pNext=&endmap};expect(&rend);
+ for(unsigned i=0;i<2;i++) {
+  const char *name=i?"vkCmdEndRendering2KHR":"vkCmdEndRendering2EXT";
+  PFN_vkVoidFunction fn=gdpa((VkDevice)1,name);assert((fn!=ngdpa((VkDevice)1,name))==enabled);
+  ((PFN_vkCmdEndRendering2KHR)fn)((VkCommandBuffer)0x789,&rend);
+ }
+ assert(rend.pNext==&endmap && endmap.pFragmentDensityOffsets==offsets && offsets[0].y==8);
  // Host-generated SPIR-V metadata fixture, never game shader bytes.
  const uint32_t words[]={0x07230203,0x10000,0,4,0,(2u<<16)|17,5291,(4u<<16)|71,1,11,5292};
  VkShaderModuleCreateInfo shader={.sType=VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,.codeSize=sizeof words,.pCode=words};expect(&shader);
  VkShaderModule sm;assert(((PFN_vkCreateShaderModule)gdpa((VkDevice)1,"vkCreateShaderModule"))((VkDevice)1,&shader,0,&sm)==VK_ERROR_INVALID_SHADER_NV);
- assert(shader.pCode==words && words[6]==5291 && calls()==8);
+ assert(shader.pCode==words && words[6]==5291 && calls()==10);
  printf("PASS strict observation=%d: original arguments/results, alias calls, native dispatch differences, absent commands preserved\n",enabled);
 }

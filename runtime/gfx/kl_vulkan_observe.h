@@ -77,6 +77,21 @@ OBS_END(CmdEndRenderPass2)
 OBS_END(CmdEndRenderPass2KHR)
 #undef OBS_END
 
+#define OBS_RENDER_END(name) \
+ OBS_TARGET(name); \
+ static void VKAPI_CALL obs_##name(VkCommandBuffer cb, const VkRenderingEndInfoKHR *info) { \
+    static unsigned calls; \
+    unsigned call = __atomic_fetch_add(&calls, 1, __ATOMIC_RELAXED); \
+    if (call < 16 || !(call % 600)) { \
+        VKI("fdm-observe " #name " called cb=%p call=%u\n", (void *)cb, call); \
+        if (info) trace_chain("observe " #name, info->pNext); \
+    } \
+    OBS_CALL(name, cb, info); \
+ }
+OBS_RENDER_END(CmdEndRendering2EXT)
+OBS_RENDER_END(CmdEndRendering2KHR)
+#undef OBS_RENDER_END
+
 OBS_TARGET(CreateShaderModule);
 static VkResult VKAPI_CALL obs_CreateShaderModule(VkDevice dev, const VkShaderModuleCreateInfo *ci,
         const VkAllocationCallbacks *allocator, VkShaderModule *out) {
@@ -125,7 +140,7 @@ static PFN_vkVoidFunction strict_observe_proc(const char *name, PFN_vkVoidFuncti
         ENTRY(GetPhysicalDeviceProperties2), ENTRY(GetPhysicalDeviceProperties2KHR),
         ENTRY(CreateImage), ENTRY(CreateRenderPass), ENTRY(CreateRenderPass2), ENTRY(CreateRenderPass2KHR),
         ENTRY(CmdBeginRendering), ENTRY(CmdBeginRenderingKHR), ENTRY(CmdEndRenderPass2), ENTRY(CmdEndRenderPass2KHR),
-        ENTRY(CreateShaderModule),
+        ENTRY(CmdEndRendering2EXT), ENTRY(CmdEndRendering2KHR), ENTRY(CreateShaderModule),
     };
 #undef ENTRY
     for (size_t i = 0; i < sizeof entries / sizeof entries[0]; i++) {
