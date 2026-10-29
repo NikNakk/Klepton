@@ -32,6 +32,11 @@ static void pass_end(VkCommandBuffer cb,const VkSubpassEndInfo *end) {
  const VkRenderPassFragmentDensityMapOffsetEndInfoEXT *f=end->pNext;
  assert(f->fragmentDensityOffsetCount==2 && f->pFragmentDensityOffsets[1].x==-32);
 }
+static void rendering_end(VkCommandBuffer cb,const VkRenderingEndInfoKHR *end) {
+ assert(cb==(VkCommandBuffer)0x789 && end==expected);calls++;
+ const VkRenderPassFragmentDensityMapOffsetEndInfoEXT *f=end->pNext;
+ assert(f->fragmentDensityOffsetCount==2 && f->pFragmentDensityOffsets[0].y==8 && f->pFragmentDensityOffsets[1].x==-32);
+}
 static VkResult shader(VkDevice dev,const VkShaderModuleCreateInfo *ci,const VkAllocationCallbacks *a,VkShaderModule *out) {
  assert(dev==(VkDevice)1 && ci==expected && ci->pCode[6]==5291 && !a);calls++;
  return VK_ERROR_INVALID_SHADER_NV;
@@ -40,6 +45,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance inst,c
  if(!strcmp(name,"vkGetPhysicalDeviceFeatures2") || !strcmp(name,"vkGetPhysicalDeviceFeatures2KHR"))return (void*)features;
  if(!strcmp(name,"vkGetPhysicalDeviceProperties2") || !strcmp(name,"vkGetPhysicalDeviceProperties2KHR"))return (void*)properties;
  if(!strcmp(name,"vkCmdEndRenderPass2") || !strcmp(name,"vkCmdEndRenderPass2KHR"))return (void*)pass_end;
+ if(!strcmp(name,"vkCmdEndRendering2EXT") || !strcmp(name,"vkCmdEndRendering2KHR"))return (void*)rendering_end;
  if(!strcmp(name,"vkCreateImage"))return (void*)image;
  if(!strcmp(name,"vkCreateShaderModule"))return (void*)shader;
  return 0;
