@@ -192,6 +192,8 @@ static uint32_t (*a_glCheckFramebufferStatus)(uint32_t);
 static void     (*a_glGetFramebufferAttachmentParameteriv)(uint32_t, uint32_t,
                                                            uint32_t, int32_t *);
 static const uint8_t *(*a_glGetString)(uint32_t);
+// Native controls supersede the legacy compositor-only sRGB workaround.
+static int g_native_srgb_write_control, g_native_srgb_decode;
 static unsigned (*a_eglMakeCurrent)(void *, void *, void *, void *);
 // ANGLE resolves GLES *extension* entry points (e.g. glTextureViewOES) through its own
 // eglGetProcAddress, not as dlsym-exported symbols — so asym() misses them. Used as a fallback
@@ -410,6 +412,11 @@ int kl_glfb_init(void) {
     a_glGetFramebufferAttachmentParameteriv =
         asym("glGetFramebufferAttachmentParameteriv");
     a_glGetString  = asym("glGetString");
+    if (a_glGetString) {
+        const char *ext = (const char *)a_glGetString(GL_EXTENSIONS);
+        g_native_srgb_write_control = ext && strstr(ext, "GL_EXT_sRGB_write_control");
+        g_native_srgb_decode = ext && strstr(ext, "GL_EXT_texture_sRGB_decode");
+    }
     g_ready = 1;
 
     // KL_GLFB_DEBUG_CB=1: register a KHR_debug callback and print every
@@ -2566,13 +2573,10 @@ static void klfb_TexParameteri(uint32_t target, uint32_t pname, int32_t param) {
     static int noswz = -1;
     if (noswz < 0) noswz = kl_env_on("KL_GLFB_NOSWIZZLE", 0);
     if (noswz && pname >= GL_TEXTURE_SWIZZLE_R && pname <= GL_TEXTURE_SWIZZLE_A) return;
-    // TEXTURE_SRGB_DECODE_EXT writes: no EXT_texture_sRGB_decode on this ANGLE,
-    // so the write can only raise INVALID_ENUM — and does, about once per
-    // frame, leaving a sticky error that Unity then reports attributed to
-    // innocent calls (and that error-bracketing probes read as everyone's
-    // fault). Dropping it is semantics-preserving here: the decode behaviour
-    // it would select does not exist on this driver either way.
-    if (pname == 0x8A48 /* TEXTURE_SRGB_DECODE_EXT */) return;
+    // Old ANGLE builds lack EXT_texture_sRGB_decode: keep their legacy error
+    // suppression, but let capable backends implement the requested sampling
+    // semantics. The capability is read from the real current ANGLE context.
+    if (pname == 0x8A48 /* TEXTURE_SRGB_DECODE_EXT */ && !g_native_srgb_decode) return;
     // The external-image retarget again — see klfb_detarget. The guest sets
     // filtering and wrap on GL_TEXTURE_EXTERNAL_OES right after binding it, and
     // those calls have to land on the same object the bind did.
@@ -7259,7 +7263,7 @@ static void klfb_srgb_note(int enabled) {
 }
 
 static void klfb_Enable(uint32_t cap) {
-    if (cap == KLFB_GL_FRAMEBUFFER_SRGB) { klfb_srgb_note(1); return; }
+    if (cap == KLFB_GL_FRAMEBUFFER_SRGB && !g_native_srgb_write_control) { klfb_srgb_note(1); return; }
     // KL_HL2_NO_CULL=1: swallow glEnable(GL_CULL_FACE) so nothing is back-face culled.
     // Diagnostic for "walls invisible from the inside" — if geometry (train interior)
     // reappears with culling off, the faces are being back-face culled (winding), not
@@ -7278,7 +7282,7 @@ static void klfb_Enable(uint32_t cap) {
 }
 
 static void klfb_Disable(uint32_t cap) {
-    if (cap == KLFB_GL_FRAMEBUFFER_SRGB) { klfb_srgb_note(0); return; }
+    if (cap == KLFB_GL_FRAMEBUFFER_SRGB && !g_native_srgb_write_control) { klfb_srgb_note(0); return; }
     if (g_real_Disable) g_real_Disable(cap);
 }
 
