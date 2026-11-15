@@ -1033,7 +1033,14 @@ static int klj_decode_args(const char *sig, kl_va *va, klj_val *argv) {
     int argc = 0;
     for (const char *p = sig + 1; *p && *p != ')'; ) {
         if (argc == KLJ_MAX_ARGS) return -1;
-        while (*p == '[') p++;                       // arrays are references
+        if (*p == '[') {                              // arrays are references,
+            while (*p == '[') p++;                    // whatever their element:
+            if (*p == 'L') { while (*p && *p != ';') p++; }   // a float[] is
+            if (!*p || *p == ')') return -1;          // still a GP pointer
+            p++;
+            argv[argc++].l = (void *)(uintptr_t)kl_va_gp(va);
+            continue;
+        }
         switch (*p) {
         case 'L':                                     // fully-qualified object
             while (*p && *p != ';') p++;
@@ -1077,7 +1084,15 @@ static int klj_decode_args_a(const char *sig, const klj_jvalue *args, klj_val *a
         // something to read. Rejecting it outright turned every zero-argument
         // A-call into "cannot decode signature".
         if (argc == KLJ_MAX_ARGS || !args) return -1;
-        while (*p == '[') p++;                       // arrays are references
+        if (*p == '[') {                              // arrays are references: an
+            while (*p == '[') p++;                    // int[] read as 'I' would be
+            if (*p == 'L') { while (*p && *p != ';') p++; }   // its pointer cut
+            if (!*p || *p == ')') return -1;          // to 32 bits
+            p++;
+            argv[argc].l = args[argc].l;
+            argc++;
+            continue;
+        }
         switch (*p) {
         case 'L':
             while (*p && *p != ';') p++;
