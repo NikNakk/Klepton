@@ -1351,7 +1351,11 @@ kl_image *kl_load(const char *path) {
 void kl_run_init(kl_image *img) {
     int trace = kl_env_on("KL_TRACE_INIT", 0);
     for (size_t i = 0; i < img->init_count; i++) {
-        if (!img->init_array[i]) continue;
+        // Android/Bionic accepts both null and -1 constructor sentinels.
+        // Older CRTs (including Gorilla Tag's Crashpad handler) leave -1 in
+        // DT_INIT_ARRAY; it is not a function address.
+        uintptr_t init = (uintptr_t)img->init_array[i];
+        if (init == 0 || init == UINTPTR_MAX) continue;
         if (trace) fprintf(stderr, "  [init] %s [%zu/%zu] -> +%#llx\n", img->path, i, img->init_count,
                            (unsigned long long)((const uint8_t *)img->init_array[i] - img->base));
         // KL_INIT_SLEEP=<basename>:<index>:<ms> pauses before that constructor; KL_INIT_SKIP=<basename>:<index> skips it.
