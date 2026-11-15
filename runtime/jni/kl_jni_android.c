@@ -293,6 +293,29 @@ static klj_val klj_ActivityManager_getMemoryInfo(void *env, void *self,
     return (klj_val){.j = 0};
 }
 
+// ActivityManager.getProcessMemoryInfo(int[] pids) -> Debug.MemoryInfo[], one
+// per pid. There is one process here, so every entry describes this one, and
+// getTotalPss answers from the same footprint the low-memory notification uses
+// (in KiB, as Android reports PSS). Open Blocks reads it for its memory panel.
+static klj_val klj_ActivityManager_getProcessMemoryInfo(void *env, void *self,
+                                                        const klj_val *a, int n) {
+    (void)env; (void)self;
+    klj_array *pids = n > 0 && a[0].l ? klj_arr(a[0].l) : NULL;
+    int count = pids ? pids->len : 0;
+    void *arr = klj_new_array('L', "android/os/Debug$MemoryInfo", count);
+    void **d = klj_arr(arr)->data;
+    for (int i = 0; i < count; i++) d[i] = klj_new_object_data("android/os/Debug$MemoryInfo", NULL);
+    KLJ_LOG("ActivityManager.getProcessMemoryInfo(%d pid(s)) -> this process's footprint", count);
+    return (klj_val){.l = arr};
+}
+
+static klj_val klj_DebugMemoryInfo_getTotalPss(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    uint64_t kib = kl_mem_footprint_bytes() >> 10;
+    KLJ_LOG("Debug.MemoryInfo.getTotalPss -> %llu KiB", (unsigned long long)kib);
+    return (klj_val){.j = (uint32_t)(kib > INT32_MAX ? INT32_MAX : kib)};
+}
+
 // ---- com.vrchat.android.plugin.Info ----
 // The title's own Java half, and it is entirely transcribed from
 // smali_classes2/com/vrchat/android/plugin/Info.smali rather than guessed:
@@ -1624,6 +1647,8 @@ const klj_binding klj_bind_android[] = {
     // matched on it exactly. Same shape as UnityPermissions below.
     {"android/text/format/DateFormat", "is24HourFormat", "(Landroid/content/Context;)Z", klj_DateFormat_is24HourFormat},
     {"android/app/ActivityManager", "getMemoryInfo", "(Landroid/app/ActivityManager$MemoryInfo;)V", klj_ActivityManager_getMemoryInfo},
+    {"android/app/ActivityManager", "getProcessMemoryInfo", "([I)[Landroid/os/Debug$MemoryInfo;", klj_ActivityManager_getProcessMemoryInfo},
+    {"android/os/Debug$MemoryInfo", "getTotalPss", "()I", klj_DebugMemoryInfo_getTotalPss},
     // VRChat's own plugin class; see the transcription note at its implementation.
     {"com/vrchat/android/plugin/Info", "instance", "()Ljava/lang/Object;", klj_VRCInfo_instance},
     {"com/vrchat/android/plugin/Info", "getVersionCode", "()I", klj_VRCInfo_getVersionCode},

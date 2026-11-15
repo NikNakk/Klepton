@@ -685,6 +685,13 @@ static klj_val klj_Process_myTid(void *env, void *self, const klj_val *a, int n)
     return (klj_val){.j = (uint32_t)tid};
 }
 
+// The host process id: the same value the guest's own getpid() import returns.
+// Unity reads it next to ActivityManager.getMemoryInfo when reporting memory.
+static klj_val klj_Process_myPid(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = (uint32_t)getpid()};
+}
+
 const klj_binding klj_bind_looper[] = {
     {"android/app/Activity",   "runOnUiThread", "(Ljava/lang/Runnable;)V", klj_Activity_runOnUiThread},
 
@@ -695,6 +702,7 @@ const klj_binding klj_bind_looper[] = {
     {"android/os/Process", "setThreadPriority", "(II)V", klj_Process_setThreadPriority},
     {"android/os/Process", "setThreadPriority", "(I)V",  klj_Process_setThreadPriority},
     {"android/os/Process", "myTid",             "()I",   klj_Process_myTid},
+    {"android/os/Process", "myPid",             "()I",   klj_Process_myPid},
 
     {"android/os/Looper",  "getMainLooper", "()Landroid/os/Looper;",  klj_Looper_getMainLooper},
     {"android/os/Looper",  "myLooper",      "()Landroid/os/Looper;",  klj_Looper_myLooper},

@@ -1520,6 +1520,7 @@ void kl_mem_report(void) {
 }
 
 uint64_t kl_mem_budget_bytes(void)    { return kl_mem_total(); }
+uint64_t kl_mem_footprint_bytes(void) { return kl_mem_footprint(); }
 uint64_t kl_mem_available_bytes(void) {
     uint64_t a = kl_proc_available();      // real jetsam headroom when available
     return a ? a : proc_free_bytes();
