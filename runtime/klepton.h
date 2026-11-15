@@ -198,6 +198,8 @@ void kl_mem_report(void);
 // Java, and the two must not answer differently.
 uint64_t kl_mem_budget_bytes(void);
 uint64_t kl_mem_available_bytes(void);
+// This process's own footprint (phys_footprint): what Debug.MemoryInfo reports as PSS.
+uint64_t kl_mem_footprint_bytes(void);
 
 // errno numbering diverges above 34 between Linux and Darwin, and guest code
 // compares against Linux's values (see kl_libc.c).
