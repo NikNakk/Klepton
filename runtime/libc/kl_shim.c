@@ -671,7 +671,14 @@ static void kl_grow_sock_buffers(int fd) {
 }
 
 static int kl_socket(int domain, int type, int protocol) {
-    // bionic AF_INET6=10 -> Darwin 30; SOCK_* types agree.
+    const int guest_domain = domain, guest_type = type;
+    // Base SOCK_* types agree, but Linux packs creation flags into type.
+    // Darwin rejects those bits (Alyx's SOCK_STREAM|SOCK_CLOEXEC -> EPROTOTYPE).
+    // Emulate just the two defined Linux flags; unknown bits still reach socket
+    // and fail rather than silently accepting an unsupported request.
+    const int cloexec = type & 0x80000, nonblock = type & 0x800;
+    type &= ~(0x80000 | 0x800);
+    // bionic AF_INET6=10 -> Darwin 30.
     if (domain == 10) domain = AF_INET6;
     // AF_NETLINK (16) has no Darwin equivalent, and socket() refusing it is NOT
     // the harmless gap it reads as. Steam Link's SVLDataLinkUber opens a
@@ -689,14 +696,37 @@ static int kl_socket(int domain, int type, int protocol) {
     // makes it readable, which is the honest answer, since the interface set does
     // not change under us. kl_bind no-ops the sockaddr_nl bind that Darwin would
     // otherwise reject.
+    const int host_domain = domain == 16 ? AF_UNIX : domain;
+    const int host_type = domain == 16 ? SOCK_DGRAM | (type & ~0xf) : type;
+    const int host_protocol = domain == 16 ? 0 : protocol;
+    int fd = socket(host_domain, host_type, host_protocol);
+    if (fd >= 0 && cloexec && fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
+        int saved = errno; close(fd); fd = -1; errno = saved;
+    }
+    if (fd >= 0 && nonblock) {
+        int flags = fcntl(fd, F_GETFL);
+        if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            int saved = errno; close(fd); fd = -1; errno = saved;
+        }
+    }
+    const int socket_error = fd < 0 ? errno : 0;
+    if (fd < 0) {
+        // Capture errno before logging or helper calls can overwrite it. Failed
+        // socket creation is rare and otherwise the guest only prints its own
+        // translated error text, losing the arguments and native error.
+        fprintf(stderr, "  [net-socket] guest domain=%d type=0x%x protocol=%d; "
+                        "host domain=%d type=0x%x protocol=%d -> fd=%d "
+                        "darwin_errno=%d (%s)\n",
+                guest_domain, guest_type, protocol, host_domain, host_type, host_protocol,
+                fd, socket_error, strerror(socket_error));
+    }
     if (domain == 16) {
-        int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
         if (kl_net_trace())
             fprintf(stderr, "  [net] socket(AF_NETLINK) -> synthetic fd %d "
                             "(interface scan uses getifaddrs, not this socket)\n", fd);
+        if (fd < 0) errno = socket_error;
         return fd;
     }
-    int fd = socket(domain, type, protocol);
     if (fd >= 0) kl_grow_sock_buffers(fd);
     // Darwin traffic-class marking for the guest's UDP sockets. Steam Link's
     // AV stream is plain UDP; stamped NET_SERVICE_TYPE_RV ("responsive
@@ -721,6 +751,7 @@ static int kl_socket(int domain, int type, int protocol) {
     if (kl_net_trace())
         fprintf(stderr, "  [net] socket(dom=%d type=%d proto=%d) -> fd %d%s\n",
                 domain, type, protocol, fd, fd < 0 ? strerror(errno) : "");
+    if (fd < 0) errno = socket_error;
     return fd;
 }
 
