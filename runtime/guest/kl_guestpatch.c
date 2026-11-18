@@ -190,6 +190,13 @@ static const kl_gp_word k_vrc_multipass[] = {
     { 0x76e0c, 0x2a0003f3, 0x52800013, "mov w19, w0 -> mov w19, #0  (MultiPass)" },
 };
 
+// The same row for VRFS (com.immersification.vrfs, libUnityOpenXR.so sha256
+// bb911274d88a81bc...): NativeConfig_SetRenderMode is the exported symbol at
+// 0xbf540, the store is [x0, #0x88], and the instruction to pin is identical.
+static const kl_gp_word k_vrfs_multipass[] = {
+    { 0xbf544, 0x2a0003f3, 0x52800013, "mov w19, w0 -> mov w19, #0  (MultiPass)" },
+};
+
 
 // (5) Unity's cross-context guard on every framebuffer bind.
 //
@@ -485,6 +492,9 @@ static const kl_gp_patch k_patches[] = {
     { "vrchat-multipass", "libUnityOpenXR.so",
       "the stereo rendering mode is MultiPass, because there is no multiview",
       k_vrc_multipass, sizeof k_vrc_multipass / sizeof *k_vrc_multipass },
+    { "vrfs-multipass", "libUnityOpenXR.so",
+      "the stereo rendering mode is MultiPass, because there is no multiview",
+      k_vrfs_multipass, sizeof k_vrfs_multipass / sizeof *k_vrfs_multipass },
     { "vrchat-under-construction", "libil2cpp.so",
       "the VRCFlowManager wall coroutine completes instead of hanging",
       k_vrc_wall, sizeof k_vrc_wall / sizeof *k_vrc_wall },

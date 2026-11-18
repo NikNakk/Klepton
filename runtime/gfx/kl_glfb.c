@@ -7981,8 +7981,32 @@ static unsigned long klfb_probe_fbo(uint32_t fb, float *fbuf, uint8_t *bbuf,
     // debug readback can afford the stall.
     if (a_glFinish) a_glFinish();
     r_BindFramebuffer(0x8CA8 /* READ_FRAMEBUFFER */, fb);
-    if (r_CheckFramebufferStatus(0x8CA8) != 0x8CD5) {
+    uint32_t fb_status = r_CheckFramebufferStatus(0x8CA8);
+    if (fb_status != 0x8CD5) {
         snprintf(note, note_n, "incomplete");
+        static int said;
+        if (said < 8) {
+            said++;
+            int32_t t = 0, n = 0;
+            r_GetFramebufferAttachmentParameteriv(0x8CA8, 0x8CE0, 0x8CD0, &t);
+            r_GetFramebufferAttachmentParameteriv(0x8CA8, 0x8CE0, 0x8CD1, &n);
+            int32_t lvl = -1, face = -1, w = -1, h = -1, smp = -1, ifmt = -1, fixed = -1;
+            r_GetFramebufferAttachmentParameteriv(0x8CA8, 0x8CE0, 0x8CD2, &lvl);
+            r_GetFramebufferAttachmentParameteriv(0x8CA8, 0x8CE0, 0x8CD3, &face);
+            static void (*q)(uint32_t, int32_t, uint32_t, int32_t *);
+            static void (*bt)(uint32_t, uint32_t);
+            if (!q) q = asym("glGetTexLevelParameteriv");
+            if (!bt) bt = asym("glBindTexture");
+            if (q && bt && t == 0x1702) {
+                bt(0x9100, (uint32_t)n);
+                q(0x9100, 0, 0x1000, &w); q(0x9100, 0, 0x1001, &h);
+                q(0x9100, 0, 0x9106, &smp); q(0x9100, 0, 0x1003, &ifmt); q(0x9100, 0, 0x9107, &fixed);
+                bt(0x9100, 0);
+            }
+            fprintf(stderr, "  [glfb] fbo%u incomplete: status 0x%x, color0 type 0x%x name %d level %d face 0x%x;"
+                    " as 2D_MULTISAMPLE: %dx%d samples %d ifmt 0x%x fixed %d\n",
+                    fb, fb_status, t, n, lvl, face, w, h, smp, ifmt, fixed);
+        }
         return 0;
     }
     int32_t otype = 0, oname = 0;

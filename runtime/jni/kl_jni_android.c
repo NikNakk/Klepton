@@ -454,6 +454,15 @@ static klj_val klj_Intent_addCategory(void *env, void *self, const klj_val *a, i
     return (klj_val){.l = self};
 }
 
+// Intent.setClassName(package, class) — another builder; the target is only
+// logged, since nothing here starts activities or services from an Intent.
+static klj_val klj_Intent_setClassName(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    const char *pkg = n > 0 ? klj_str(a[0].l) : NULL, *cls = n > 1 ? klj_str(a[1].l) : NULL;
+    KLJ_LOG("Intent.setClassName(\"%s\", \"%s\")", pkg ? pkg : "(null)", cls ? cls : "(null)");
+    return (klj_val){.l = self};
+}
+
 // ---- IntentFilter + registerReceiver: the STICKY battery query --------------
 //
 // libunity reads the battery exactly as Android documents it: build an
@@ -1584,6 +1593,8 @@ const klj_binding klj_bind_android[] = {
     {"android/content/Intent", "getExtras",  "()Landroid/os/Bundle;",      klj_Intent_getExtras},
     {"android/content/Intent", "<init>",     "(Ljava/lang/String;)V",      klj_Intent_init},
     {"android/content/Intent", "addCategory", "(Ljava/lang/String;)Landroid/content/Intent;", klj_Intent_addCategory},
+    {"android/content/Intent", "setClassName",
+     "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;", klj_Intent_setClassName},
     {"android/content/Intent", "getIntExtra", "(Ljava/lang/String;I)I",     klj_Intent_getIntExtra},
     {"android/content/Intent", "getBooleanExtra", "(Ljava/lang/String;Z)Z", klj_Intent_getBooleanExtra},
     // Our synthetic launcher Intent carries no extras, so hasExtra is always
@@ -1668,6 +1679,10 @@ const klj_binding klj_bind_android[] = {
     {"android/content/Context", "getObbDir",  "()Ljava/io/File;",  klj_Context_getObbDir},
     {"android/content/pm/PackageManager", "queryIntentActivities",
      "(Landroid/content/Intent;I)Ljava/util/List;", klj_PM_queryIntentActivities},
+    // No other apps are installed here, so no Intent resolves to a service: null.
+    // (VRFS probes for the Virtuix Omni treadmill's SharedMemoryService this way.)
+    {"android/content/pm/PackageManager", "resolveService",
+     "(Landroid/content/Intent;I)Landroid/content/pm/ResolveInfo;", klj_false},
     {"java/lang/Object", "<init>",   "()V",                   klj_generic_init},
     {"java/lang/Object", "getClass", "()Ljava/lang/Class;", klj_Object_getClass},
     {"java/lang/String", "equals", "(Ljava/lang/Object;)Z", klj_String_equals},

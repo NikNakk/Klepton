@@ -1942,7 +1942,7 @@ X(klb_pthread_getschedparam) X(klb_pthread_setschedparam)
 X(klb_dlopen) X(klb_dlsym) X(klb_dlclose) X(klb_dlerror) X(klb_dladdr)
 X(klb_clock_gettime) X(klb_clock_getres) X(klb_gettimeofday)
 // kl_libc_slink.c — the surface Steam Link reaches for and Beat Saber does not.
-X(klb_getauxval)
+X(klb_getauxval) X(klb_process_vm_readv)
 X(klb_fegetenv) X(klb_fesetenv) X(klb_feholdexcept) X(klb_feupdateenv)
 X(klb_statvfs) X(klb_fstatvfs) X(klb_sendfile)
 X(klb_epoll_create) X(klb_epoll_create1) X(klb_epoll_ctl) X(klb_epoll_wait)
@@ -2101,6 +2101,7 @@ static const kl_entry g_shim[] = {
     // definition — a divergent layout, a colliding signature, or no Darwin
     // equivalent at all. None of them may become a direct forward.
     E("getauxval", klb_getauxval),
+    E("process_vm_readv", klb_process_vm_readv),
     E("fegetenv", klb_fegetenv), E("fesetenv", klb_fesetenv),
     E("feholdexcept", klb_feholdexcept), E("feupdateenv", klb_feupdateenv),
     E("statvfs", klb_statvfs), E("fstatvfs", klb_fstatvfs),

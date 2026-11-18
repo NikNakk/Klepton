@@ -1100,3 +1100,39 @@ void klb___pthread_cleanup_pop(void *c, int execute) {
     g_cleanups = rec->prev;
     if (execute && rec->routine) rec->routine(rec->arg);
 }
+
+// process_vm_readv(pid, local, liovcnt, remote, riovcnt, flags) — Linux-only.
+// libunity and libil2cpp use it on their OWN pid as a read that fails instead
+// of faulting on an unmapped address. mach_vm_read_overwrite on our own task
+// is exactly that on Darwin. Another pid is refused (EPERM), as Android's
+// sandbox would. struct iovec is {void *, size_t} on both platforms.
+#include <mach/mach.h>
+#include <sys/uio.h>
+extern kern_return_t mach_vm_read_overwrite(vm_map_t, mach_vm_address_t, mach_vm_size_t,
+                                            mach_vm_address_t, mach_vm_size_t *);
+long klb_process_vm_readv(int pid, const struct iovec *local, unsigned long liovcnt,
+                          const struct iovec *remote, unsigned long riovcnt, unsigned long flags) {
+    if (flags || liovcnt > 1024 || riovcnt > 1024) { errno = EINVAL; return -1; }
+    if (pid != getpid()) { errno = EPERM; return -1; }
+    long total = 0;
+    unsigned long li = 0, ri = 0;
+    size_t loff = 0, roff = 0;
+    while (li < liovcnt && ri < riovcnt) {
+        size_t lleft = local[li].iov_len - loff, rleft = remote[ri].iov_len - roff;
+        if (!lleft) { li++; loff = 0; continue; }
+        if (!rleft) { ri++; roff = 0; continue; }
+        size_t n = lleft < rleft ? lleft : rleft;
+        mach_vm_size_t got = 0;
+        kern_return_t kr = mach_vm_read_overwrite(mach_task_self(),
+            (mach_vm_address_t)((char *)remote[ri].iov_base + roff), n,
+            (mach_vm_address_t)((char *)local[li].iov_base + loff), &got);
+        if (kr != KERN_SUCCESS) {
+            // Linux reports a partial read as the count so far, EFAULT only if nothing was read.
+            if (total) return total;
+            errno = EFAULT;
+            return -1;
+        }
+        total += (long)got; loff += got; roff += got;
+    }
+    return total;
+}

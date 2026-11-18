@@ -484,6 +484,20 @@ const klj_binding klj_bind_net[] = {
      "(Landroid/app/Activity;)V", klj_void_noop},
     {"com/epicgames/mobile/eossdk/EOSSDK", "init",
      "(Lcom/unity3d/player/UnityPlayerActivity;)V", klj_void_noop},
+    // VRFS's own Java plugins (gg.vrfs.*). Unity reflection looks them up with the
+    // runtime argument class, so both the declared and the Unity-activity forms are
+    // listed. QuitGuard watches the activity lifecycle to flush PlayerPrefs on quit
+    // (prefs are written through as they change here); SystemVolume listens for
+    // Android volume broadcasts, which never arrive here. VrfsVideoEncoder (the
+    // in-game recorder) is left out on purpose: it is only used when recording.
+    {"gg/vrfs/quit/VrfsQuitGuard", "install", "(Landroid/app/Activity;)V", klj_void_noop},
+    {"gg/vrfs/quit/VrfsQuitGuard", "install",
+     "(Lcom/unity3d/player/UnityPlayerActivity;)V", klj_void_noop},
+    {"gg/vrfs/quit/VrfsQuitGuard", "setUnityQuitting", "()V", klj_void_noop},
+    {"gg/vrfs/audio/VrfsSystemVolume", "start",
+     "(Landroid/content/Context;Lgg/vrfs/audio/VrfsSystemVolume$Listener;)V", klj_void_noop},
+    {"gg/vrfs/audio/VrfsSystemVolume", "start",
+     "(Lcom/unity3d/player/UnityPlayerActivity;Lgg/vrfs/audio/VrfsSystemVolume$Listener;)V", klj_void_noop},
     // Meta Horizon platform client config ctor (ZIX). Meta platform SDK, like
     // the Oculus platform — construct the object (NewObject makes it) and let
     // the ctor be a no-op; the game boots without Horizon platform services.
