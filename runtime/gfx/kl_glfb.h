@@ -9,6 +9,8 @@
 #include <stdio.h>
 
 int  kl_glfb_enabled(void);
+// KL_GLFB_BACKEND=zink: Mesa Zink instead of ANGLE (see kl_glfb.c).
+int  kl_glfb_backend_is_zink(void);
 int  kl_glfb_init(void);
 void kl_glfb_set_size(int w, int h);
 

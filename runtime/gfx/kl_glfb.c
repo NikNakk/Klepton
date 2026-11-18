@@ -37,6 +37,8 @@
 // The flat door's zero-readback storage. IOSurfaceRef.h by name: the umbrella
 // IOSurface.h is macOS-only, and visionOS ships only the Ref/Types split.
 #include <IOSurface/IOSurfaceRef.h>
+#include <objc/message.h>   // klfb_zink_mtl_device asks an MTLTexture for its device
+#include <objc/runtime.h>
 #include "kl_glfb.h"
 #include "kl_cvmtl.h"      // native-format video frames as MTLTextures
 #include "kl_present.h"
@@ -96,6 +98,66 @@ static const char *kl_angle_dir(void) {
     return ANGLE_VENDORED_DIR;
 }
 
+// KL_GLFB_BACKEND=zink: Mesa's EGL/GLES with the Zink gallium driver over a
+// Vulkan ICD (KosmicKrisp on Metal) instead of ANGLE. ANGLE's Metal backend
+// stops at GLES 3.0; Zink reaches the ES 3.1/3.2 that Klepton tells guests it
+// has (multisampled textures, compute, multiview) once Mesa is asked to report
+// it — KosmicKrisp has no transform feedback or geometry shaders, so Mesa's own
+// version check stops at 2.0. See threshold-runtime docs/android/zink-gles-backend.md.
+//
+// KL_ZINK_DIR is the Mesa build (threshold-runtime android/zink/build.sh) or an
+// install with libEGL/libGLESv2 side by side. The Vulkan ICD comes from the
+// usual VK_DRIVER_FILES.
+#define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
+#define EGL_CONTEXT_MAJOR_VERSION     0x3098
+#define EGL_CONTEXT_MINOR_VERSION     0x30FB
+
+static int klfb_zink(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *b = kl_env_str("KL_GLFB_BACKEND", NULL);
+        on = b && !strcmp(b, "zink");
+    }
+    return on;
+}
+int kl_glfb_backend_is_zink(void) { return klfb_zink(); }
+
+// The context every creation site asks for. ANGLE gets "ES 3" and answers 3.0;
+// Mesa answers exactly what is asked, so ask for the version it was told to report.
+static int32_t g_ctx_attrs[5] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE, 0, EGL_NONE };
+
+// Mesa reads its configuration from the environment when EGL initializes, so it
+// is set here, before eglInitialize; anything the caller already set wins.
+static void klfb_zink_environment(const char *dir) {
+    char path[1024];
+    setenv("MESA_LOADER_DRIVER_OVERRIDE", "zink", 0);
+    snprintf(path, sizeof path, "%s/src/gallium/targets/dri", dir);
+    if (access(path, R_OK) != 0) snprintf(path, sizeof path, "%s", dir);
+    setenv("LIBGL_DRIVERS_PATH", path, 0);
+    setenv("MESA_GLES_VERSION_OVERRIDE", "3.2", 0);
+    const char *v = getenv("MESA_GLES_VERSION_OVERRIDE");
+    const char *glsl = !strcmp(v, "3.2") ? "320" : !strcmp(v, "3.1") ? "310" : !strcmp(v, "3.0") ? "300" : NULL;
+    if (glsl) setenv("MESA_GLSL_VERSION_OVERRIDE", glsl, 0);
+    // KosmicKrisp lacks EXT_custom_border_color, which Zink treats as a base
+    // requirement; this is KosmicKrisp's own experimental implementation.
+    setenv("MESA_KK_EXPERIMENTAL", "custom_border", 0);
+    int major = 3, minor = 2;
+    if (sscanf(v, "%d.%d", &major, &minor) != 2) { major = 3; minor = 2; }
+    g_ctx_attrs[0] = EGL_CONTEXT_MAJOR_VERSION; g_ctx_attrs[1] = major;
+    g_ctx_attrs[2] = EGL_CONTEXT_MINOR_VERSION; g_ctx_attrs[3] = minor;
+    g_ctx_attrs[4] = EGL_NONE;
+}
+
+// A Mesa build tree keeps the two libraries apart; an install puts them together.
+static void *zink_dlopen(const char *dir, const char *name, const char *build_subdir) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/%s/%s.dylib", dir, build_subdir, name);
+    void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (h) return h;
+    snprintf(path, sizeof path, "%s/%s.dylib", dir, name);
+    return dlopen(path, RTLD_NOW | RTLD_LOCAL);
+}
+
 // ANGLE arrives in two shapes and the port needs both: a bare dylib on macOS,
 // and a .framework bundle on visionOS (ANGLE emits ios_framework_bundle for
 // iOS-family targets, and an app may only load code from inside its bundle
@@ -116,6 +178,10 @@ static void *angle_dlopen(const char *dir, const char *name) {
 
 static void *g_egl_lib, *g_gles_lib;
 static void *g_dpy, *g_surf, *g_ctx, *g_cfg;
+// Under Zink: the context-less query context (see klfb_q_begin).
+static void *(*a_eglGetCurrentContext)(void);
+static void *g_qctx, *g_qsurf;
+static pthread_mutex_t g_qlock = PTHREAD_MUTEX_INITIALIZER;
 // Kept so per-thread contexts can be created later, after init has chosen a config.
 static void *(*a_eglCreateContext)(void *, void *, void *, const int32_t *);
 static void *(*a_eglCreatePbufferSurface)(void *, void *, const int32_t *);
@@ -270,8 +336,26 @@ int kl_glfb_init(void) {
     }
 
     const char *dir = kl_angle_dir();
+    if (klfb_zink()) {
+        dir = kl_env_str("KL_ZINK_DIR", NULL);
+        if (!dir) {
+            fprintf(stderr, "  [glfb] KL_GLFB_BACKEND=zink needs KL_ZINK_DIR (the Mesa build) — "
+                            "staying on the null driver\n");
+            return 0;
+        }
+        klfb_zink_environment(dir);
+        // libGLESv2 first: libEGL resolves the GL dispatch through the image already loaded.
+        g_gles_lib = zink_dlopen(dir, "libGLESv2", "src/mesa/glapi/es2api");
+        g_egl_lib  = zink_dlopen(dir, "libEGL", "src/egl");
+        if (!g_egl_lib || !g_gles_lib) {
+            fprintf(stderr, "  [glfb] cannot load Mesa from %s\n         (%s)\n"
+                            "         staying on the null driver\n", dir, dlerror());
+            return 0;
+        }
+    } else {
     g_egl_lib  = angle_dlopen(dir, "libEGL");
     g_gles_lib = angle_dlopen(dir, "libGLESv2");
+    }
     if (!g_egl_lib || !g_gles_lib) {
         fprintf(stderr, "  [glfb] cannot load ANGLE from %s\n         (%s)\n"
                         "         build it with 'make angle-debug' — that pulls and "
@@ -284,6 +368,10 @@ int kl_glfb_init(void) {
 
     void *(*eglGetPlatformDisplayEXT)(uint32_t, void *, const int32_t *) =
         asym("eglGetPlatformDisplayEXT");
+    // Mesa exports only the EGL 1.5 core name (it takes EGLAttrib, which is
+    // pointer-sized; every attribute list passed here is NULL or empty-terminated
+    // at index 0 under Zink, so the width never matters).
+    if (!eglGetPlatformDisplayEXT && klfb_zink()) eglGetPlatformDisplayEXT = asym("eglGetPlatformDisplay");
     unsigned (*eglInitialize)(void *, int32_t *, int32_t *) = asym("eglInitialize");
     unsigned (*eglChooseConfig)(void *, const int32_t *, void **, int32_t, int32_t *) =
         asym("eglChooseConfig");
@@ -302,8 +390,9 @@ int kl_glfb_init(void) {
         EGL_PLATFORM_ANGLE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE,
         EGL_NONE,
     };
-    g_dpy = eglGetPlatformDisplayEXT(EGL_PLATFORM_ANGLE_ANGLE, EGL_DEFAULT_DISPLAY,
-                                     dpy_attrs);
+    g_dpy = klfb_zink()
+        ? eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL)
+        : eglGetPlatformDisplayEXT(EGL_PLATFORM_ANGLE_ANGLE, EGL_DEFAULT_DISPLAY, dpy_attrs);
     int32_t major = 0, minor = 0;
     if (!g_dpy || !eglInitialize(g_dpy, &major, &minor)) {
         fprintf(stderr, "  [glfb] eglInitialize failed\n");
@@ -331,7 +420,10 @@ int kl_glfb_init(void) {
     // readback path — and MakeCurrent gets its own retry below because a
     // surface that CREATES but cannot go current would otherwise take the
     // whole renderer down for what is only a display optimisation.
-    if (g_flat_request) {
+    if (g_flat_request && klfb_zink())
+        fprintf(stderr, "  [glfb] flat surface: no IOSurface pbuffer under Zink yet — "
+                        "keeping the readback path\n");
+    if (g_flat_request && !klfb_zink()) {
         void *(*mkclient)(void *, uint32_t, void *, void *, const int32_t *) =
             asym("eglCreatePbufferFromClientBuffer");
         if (mkclient) {
@@ -385,8 +477,7 @@ int kl_glfb_init(void) {
                     g_w, g_h);
     }
     if (!g_surf) g_surf = a_eglCreatePbufferSurface(g_dpy, cfg, surf_attrs);
-    const int32_t ctx_attrs[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
-    g_ctx  = a_eglCreateContext(g_dpy, cfg, EGL_NO_CONTEXT, ctx_attrs);
+    g_ctx  = a_eglCreateContext(g_dpy, cfg, EGL_NO_CONTEXT, g_ctx_attrs);
     if (g_surf && g_ctx && g_flat_ios && !a_eglMakeCurrent(g_dpy, g_surf, g_surf, g_ctx)) {
         // The IOSurface surface created but cannot go current: retire it and
         // retry on an ordinary pbuffer before declaring the renderer down.
@@ -436,7 +527,7 @@ int kl_glfb_init(void) {
             fprintf(stderr, "  [glfb] no glDebugMessageCallback in this ANGLE\n");
         }
     }
-    fprintf(stderr, "  [glfb] ANGLE %dx%d — %s\n", g_w, g_h,
+    fprintf(stderr, "  [glfb] %s %dx%d — %s\n", klfb_zink() ? "Zink" : "ANGLE", g_w, g_h,
             a_glGetString ? (const char *)a_glGetString(GL_RENDERER) : "?");
     fprintf(stderr, "  [glfb] %s\n",
             a_glGetString ? (const char *)a_glGetString(GL_VERSION) : "?");
@@ -464,6 +555,13 @@ int kl_glfb_init(void) {
     // ran with no context: silently, since that is not an error, just nothing.
     // Whoever asks next through kl_glfb_make_current gets it.
     a_eglMakeCurrent(g_dpy, NULL, NULL, NULL);
+    if (klfb_zink()) {
+        a_eglGetCurrentContext = asym("eglGetCurrentContext");
+        const int32_t q_attrs[] = { EGL_WIDTH, 16, EGL_HEIGHT, 16, EGL_NONE };
+        g_qsurf = a_eglCreatePbufferSurface(g_dpy, g_cfg, q_attrs);
+        g_qctx  = g_qsurf ? a_eglCreateContext(g_dpy, g_cfg, g_ctx, g_ctx_attrs) : NULL;
+        if (!g_qctx) fprintf(stderr, "  [glfb] no query context: context-less GL queries will read nothing\n");
+    }
     klfb_selftest();
     return 1;
 }
@@ -549,9 +647,8 @@ void kl_glfb_make_current(void) {
                             (unsigned long long)tid, (unsigned long long)g_root_owner);
                 }
                 const int32_t surf_attrs[] = { EGL_WIDTH, g_w, EGL_HEIGHT, g_h, EGL_NONE };
-                const int32_t ctx_attrs[]  = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
                 t->surf = a_eglCreatePbufferSurface(g_dpy, g_cfg, surf_attrs);
-                t->ctx  = a_eglCreateContext(g_dpy, g_cfg, g_ctx, ctx_attrs);
+                t->ctx  = a_eglCreateContext(g_dpy, g_cfg, g_ctx, g_ctx_attrs);
                 // NOT the root owner — this is a second, shared context, so
                 // g_root_owner is left with the original holder.
             }
@@ -559,7 +656,6 @@ void kl_glfb_make_current(void) {
             // SHARED: per-thread contexts — see the mode comment above for why
             // the guest's FBOs break here.
             const int32_t surf_attrs[] = { EGL_WIDTH, g_w, EGL_HEIGHT, g_h, EGL_NONE };
-            const int32_t ctx_attrs[]  = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
             t->surf = a_eglCreatePbufferSurface(g_dpy, g_cfg, surf_attrs);
             // KL_GLFB_NOSHARE_OBJ=1 gives the thread its own context that shares
             // *nothing*. The guest then renders with objects it cannot see, so the
@@ -567,7 +663,7 @@ void kl_glfb_make_current(void) {
             // the AGX abort needs object sharing at all, or merely a second thread
             // issuing GL. Rendering correctness is not the point of this knob.
             void *share = kl_env_on("KL_GLFB_NOSHARE_OBJ", 0) ? EGL_NO_CONTEXT : g_ctx;
-            t->ctx  = a_eglCreateContext(g_dpy, g_cfg, share, ctx_attrs);
+            t->ctx  = a_eglCreateContext(g_dpy, g_cfg, share, g_ctx_attrs);
         }
         pthread_setspecific(g_tls_key, t);
         fprintf(stderr, "  [glfb] thread %llu gets its own %s context\n",
@@ -1416,7 +1512,13 @@ static void klfb_ShaderSource(uint32_t shader, int32_t count,
                     }
                 }
             }
-            char *rewritten = klfb_rewrite_glsl(buf, cap, shader);
+            // The rewrite lowers ES 3.1/3.2 sources to what ANGLE's ES 3.0 context
+            // accepts. Under Zink the context is the ES 3.2 the guest is told about,
+            // and lowering breaks real 3.1 features (Unity's GPU-skinning compute
+            // shaders); only the per-shader pin record is cleared.
+            char *rewritten = NULL;
+            if (klfb_zink()) klfb_pin_reset(shader);
+            else rewritten = klfb_rewrite_glsl(buf, cap, shader);
             int stored = 0;
             if (g_fb_nshaders < KLFB_MAX_SHADERS) {
                 pthread_mutex_lock(&g_compile_lock);
@@ -3040,11 +3142,48 @@ static int mtl_resolve(void) {
         && a_eglQueryDeviceAttribEXT && a_glBindTexture_mtl;
 }
 
+// Under Zink the Metal device is KosmicKrisp's. EGL has no query for it, so
+// export a 1x1 texture's MTLTexture (eglExportMetalTextureMESA, kk-zink fork)
+// and ask it for its device. The device outlives the texture.
+struct klfb_metal_texture { void *mtl_texture; uint32_t width, height, levels, samples; };
+static void *klfb_zink_mtl_device(void) {
+    int (*export_metal)(void *, void *, unsigned, struct klfb_metal_texture *) =
+        a_eglGetProcAddress ? a_eglGetProcAddress("eglExportMetalTextureMESA") : NULL;
+    void (*gen)(int32_t, uint32_t *) = asym("glGenTextures");
+    void (*del)(int32_t, const uint32_t *) = asym("glDeleteTextures");
+    void (*bind)(uint32_t, uint32_t) = asym("glBindTexture");
+    void (*storage)(uint32_t, int32_t, uint32_t, int32_t, int32_t) = asym("glTexStorage2D");
+    if (!export_metal || !gen || !del || !bind || !storage) {
+        fprintf(stderr, "  [glfb] this Mesa has no eglExportMetalTextureMESA — no MTLDevice to share\n");
+        return NULL;
+    }
+    // On the query context, unless this thread already has one current.
+    void *cur = a_eglGetCurrentContext ? a_eglGetCurrentContext() : NULL;
+    int q = !cur && g_qctx;
+    if (q) { pthread_mutex_lock(&g_qlock); a_eglMakeCurrent(g_dpy, g_qsurf, g_qsurf, g_qctx); cur = g_qctx; }
+    void *dev = NULL;
+    if (cur) {
+        uint32_t t = 0;
+        gen(1, &t);
+        bind(GL_TEXTURE_2D, t);
+        storage(GL_TEXTURE_2D, 1, GL_RGBA8, 1, 1);
+        struct klfb_metal_texture m = {0};
+        if (export_metal(g_dpy, cur, t, &m) == 0 && m.mtl_texture)
+            dev = ((void *(*)(void *, SEL))objc_msgSend)(m.mtl_texture, sel_registerName("device"));
+        bind(GL_TEXTURE_2D, 0);
+        del(1, &t);
+    }
+    if (q) { a_eglMakeCurrent(g_dpy, NULL, NULL, NULL); pthread_mutex_unlock(&g_qlock); }
+    if (!dev) fprintf(stderr, "  [glfb] Metal export failed — no MTLDevice to share\n");
+    return dev;
+}
+
 void *kl_glfb_mtl_device(void) {
     static void *dev;
     static int tried;
     if (tried) return dev;
     tried = 1;
+    if (klfb_zink()) return dev = kl_glfb_init() ? klfb_zink_mtl_device() : NULL;
     if (!kl_glfb_init() || !mtl_resolve()) return NULL;
     intptr_t egl_dev = 0, mtl = 0;
     if (!a_eglQueryDisplayAttribEXT ||
@@ -6212,6 +6351,12 @@ static void klfb_DrawElementsBaseVertex(uint32_t mode, int32_t count, uint32_t t
                                         const void *indices, int32_t basevertex) {
     klfb_apply_vertex_bindings();
     klfb_note_draw();
+    // Under Zink the context is ES 3.2, where the core entry point is valid.
+    if (klfb_zink() && g_real_DrawElementsBaseVertex) {
+        g_real_DrawElementsBaseVertex(mode, count, type, indices, basevertex);
+        klfb_draw_probe(count);
+        return;
+    }
     static int resolved;
     if (!resolved) {
         resolved = 1;
@@ -6259,6 +6404,11 @@ static void klfb_DrawRangeElementsBaseVertex(uint32_t mode, uint32_t start, uint
     klfb_apply_vertex_bindings();
     klfb_service_capture();
     klfb_note_draw();
+    if (klfb_zink() && g_real_DrawRangeElementsBaseVertex) {   // core in ES 3.2
+        g_real_DrawRangeElementsBaseVertex(mode, start, end, count, type, indices, basevertex);
+        klfb_draw_probe(count);
+        return;
+    }
     static int resolved;
     if (!resolved) {
         resolved = 1;
@@ -6831,6 +6981,10 @@ static void klfb_GetInteger64v(uint32_t, int64_t *);
 static void klfb_GetIntegeri_v(uint32_t, uint32_t, int32_t *);
 static void klfb_GetInternalformativ(uint32_t, uint32_t, uint32_t, int32_t, int32_t *);
 static void (*g_real_GetIntegerv)(uint32_t, int32_t *);
+static const uint8_t *(*g_real_GetString)(uint32_t);
+static const uint8_t *(*g_real_GetStringi)(uint32_t, uint32_t);
+static const uint8_t *klfb_GetString(uint32_t name);
+static const uint8_t *klfb_GetStringi(uint32_t name, uint32_t index);
 static void (*g_real_GetFloatv)(uint32_t, float *);
 static void (*g_real_GetBooleanv)(uint32_t, uint8_t *);
 static void (*g_real_GetInteger64v)(uint32_t, int64_t *);
@@ -7394,6 +7548,8 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
     // the hybrid query family — ours if the capability tables describe the
     // pname, ANGLE's otherwise (see the gateway comment below)
     {"glGetIntegerv", (void *)klfb_GetIntegerv, (void **)&g_real_GetIntegerv},
+    {"glGetString",   (void *)klfb_GetString,   (void **)&g_real_GetString},
+    {"glGetStringi",  (void *)klfb_GetStringi,  (void **)&g_real_GetStringi},
     {"glGetFloatv",   (void *)klfb_GetFloatv,   (void **)&g_real_GetFloatv},
     {"glGetBooleanv", (void *)klfb_GetBooleanv, (void **)&g_real_GetBooleanv},
     {"glGetInteger64v", (void *)klfb_GetInteger64v, (void **)&g_real_GetInteger64v},
@@ -7467,7 +7623,44 @@ static int glfb_state_pname(uint32_t p) {
     return 0;
 }
 
+// Unity (and other engines) read strings and limits before making any context
+// current. The null driver and kl_egl.c's tables answered those without a
+// context; Mesa answers nothing without one. Under Zink, a query issued on a
+// thread with no current context briefly binds a small query context that
+// shares with the root, so it gets Mesa's real answer.
+static int klfb_q_begin(void) {
+    if (!klfb_zink() || !g_qctx || !a_eglGetCurrentContext || a_eglGetCurrentContext()) return 0;
+    pthread_mutex_lock(&g_qlock);
+    if (a_eglMakeCurrent(g_dpy, g_qsurf, g_qsurf, g_qctx)) return 1;
+    pthread_mutex_unlock(&g_qlock);
+    return 0;
+}
+static void klfb_q_end(int bound) {
+    if (!bound) return;
+    a_eglMakeCurrent(g_dpy, NULL, NULL, NULL);
+    pthread_mutex_unlock(&g_qlock);
+}
+static const uint8_t *klfb_GetString(uint32_t name) {
+    int q = klfb_q_begin();
+    const uint8_t *r = g_real_GetString ? g_real_GetString(name) : NULL;
+    klfb_q_end(q);
+    return r ? r : (const uint8_t *)"";
+}
+static const uint8_t *klfb_GetStringi(uint32_t name, uint32_t index) {
+    int q = klfb_q_begin();
+    const uint8_t *r = g_real_GetStringi ? g_real_GetStringi(name, index) : NULL;
+    klfb_q_end(q);
+    return r ? r : (const uint8_t *)"";
+}
+
+// Under Zink the context really is the ES 3.2 the guest is told about, so the
+// limits, extensions and indexed state are Mesa's own: the tables in kl_egl.c
+// describe ANGLE's ES 3.0 and would understate (texture units, multiview) or
+// overstate what this driver does.
 static void klfb_GetIntegerv(uint32_t pname, int32_t *params) {
+    if (klfb_zink() && g_real_GetIntegerv) {
+        int q = klfb_q_begin(); g_real_GetIntegerv(pname, params); klfb_q_end(q); return;
+    }
     if (glfb_state_pname(pname)) {
         if (g_real_GetIntegerv) g_real_GetIntegerv(pname, params);
         return;
@@ -7479,17 +7672,24 @@ static void klfb_GetIntegerv(uint32_t pname, int32_t *params) {
     if (params) params[0] = 0;
 }
 static void klfb_GetFloatv(uint32_t pname, float *data) {
-    if (kl_gl_cap_floatv(pname, data)) return;
+    if (!klfb_zink() && kl_gl_cap_floatv(pname, data)) return;
+    int q = klfb_q_begin();
     if (g_real_GetFloatv) g_real_GetFloatv(pname, data);
+    klfb_q_end(q);
 }
 static void klfb_GetBooleanv(uint32_t pname, uint8_t *data) {
     if (g_real_GetBooleanv) g_real_GetBooleanv(pname, data);   // no table: all state
 }
 static void klfb_GetInteger64v(uint32_t pname, int64_t *data) {
-    if (kl_gl_cap_integer64v(pname, data)) return;
+    if (!klfb_zink() && kl_gl_cap_integer64v(pname, data)) return;
+    int q = klfb_q_begin();
     if (g_real_GetInteger64v) g_real_GetInteger64v(pname, data);
+    klfb_q_end(q);
 }
 static void klfb_GetIntegeri_v(uint32_t target, uint32_t index, int32_t *data) {
+    if (klfb_zink() && g_real_GetIntegeri_v) {
+        int q = klfb_q_begin(); g_real_GetIntegeri_v(target, index, data); klfb_q_end(q); return;
+    }
     // Indexed *binding* state is dynamic, like the pnames above.
     switch (target) {
     case 0x8A28: case 0x8A29: case 0x8A2A:          // UNIFORM_BUFFER_*
@@ -7503,9 +7703,11 @@ static void klfb_GetIntegeri_v(uint32_t target, uint32_t index, int32_t *data) {
 }
 static void klfb_GetInternalformativ(uint32_t target, uint32_t internalformat,
                                      uint32_t pname, int32_t bufSize, int32_t *params) {
-    if (kl_gl_cap_internalformativ(target, internalformat, pname, bufSize, params)) return;
+    if (!klfb_zink() && kl_gl_cap_internalformativ(target, internalformat, pname, bufSize, params)) return;
+    int q = klfb_q_begin();
     if (g_real_GetInternalformativ)
         g_real_GetInternalformativ(target, internalformat, pname, bufSize, params);
+    klfb_q_end(q);
 }
 
 static const char *const g_keep_ours[] = {
@@ -7513,6 +7715,7 @@ static const char *const g_keep_ours[] = {
 };
 
 static int keep_ours(const char *name) {
+    if (klfb_zink()) return 0;   // Mesa's version and extension strings are the truth here
     for (size_t i = 0; i < sizeof g_keep_ours / sizeof g_keep_ours[0]; i++)
         if (strcmp(g_keep_ours[i], name) == 0) return 1;
     return 0;
@@ -7575,9 +7778,8 @@ static void *klfb_selftest_thread(void *arg) {
     if (!mkpb || !mkctx || !a_eglMakeCurrent) return NULL;
 
     const int32_t surf_attrs[] = { EGL_WIDTH, 256, EGL_HEIGHT, 256, EGL_NONE };
-    const int32_t ctx_attrs[]  = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
     void *surf = mkpb(g_dpy, g_cfg, surf_attrs);
-    void *ctx  = mkctx(g_dpy, g_cfg, g_ctx, ctx_attrs);
+    void *ctx  = mkctx(g_dpy, g_cfg, g_ctx, g_ctx_attrs);
     fprintf(stderr, "  [glfb] selftest: surf=%p ctx=%p\n", surf, ctx);
     if (!surf || !ctx) return NULL;
     if (!a_eglMakeCurrent(g_dpy, surf, surf, ctx)) {
